@@ -3,6 +3,8 @@
 Banco de fotos por categorías, publicaciones programadas y un programador que
 deja la imagen (foto + texto superpuesto) y el texto del post listos a su hora.
 Tú publicas a mano; el panel solo prepara.
+Las publicaciones en modo «Eventos» se programan respecto a los eventos que el
+panel lee de Racecore por la red local (o que se crean a mano).
 
 Arranque: doble clic en 2_probar.bat  (o: .venv\\Scripts\\python app.py --abrir)
 Panel:    http://localhost:5000
@@ -10,6 +12,7 @@ Panel:    http://localhost:5000
 import logging
 import os
 import random
+import re
 import secrets
 import sqlite3
 import sys
@@ -20,6 +23,7 @@ import webbrowser
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, url_for
@@ -52,6 +56,11 @@ LADO_MAX_FOTO = 3000                # las fotos se guardan como mucho a este tam
 Image.MAX_IMAGE_PIXELS = 400_000_000  # fotos de móvil de 200 MP
 GRACIA = timedelta(minutes=10)      # margen si el PC estaba ocupado justo a la hora
 DIAS_CONSERVAR = 60                 # las imágenes generadas se borran pasado este tiempo
+CADA_SINCRONIZAR = 600              # segundos entre lecturas de Racecore
+RACECORE_PUERTO = 8100
+MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
+CONDICIONES = {"": "Siempre", "abierta": "Solo con la inscripción abierta", "plazas": "Solo si quedan plazas",
+               "resultados": "Solo cuando haya resultados"}
 
 # Ajustes editables desde el panel (si están vacíos se mira la variable de entorno)
 AJUSTES_ENV = {
@@ -62,7 +71,7 @@ AJUSTES_ENV = {
 }
 
 log = logging.getLogger("racecore")
-ESTADO = {"ultima_comprobacion": None}
+ESTADO = {"ultima_comprobacion": None, "racecore_ok": None, "racecore_error": "", "racecore_n": None}
 DIBUJO = threading.Lock()   # las fuentes de Pillow no se deben usar en dos hilos a la vez
 
 
@@ -81,17 +90,28 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     titulo TEXT NOT NULL DEFAULT '', subtitulo TEXT NOT NULL DEFAULT '', pie TEXT NOT NULL DEFAULT '',
     texto TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '#e10600',
     prompt_ia TEXT NOT NULL DEFAULT '', diseno TEXT NOT NULL DEFAULT 'cartel',
-    estilo_ia TEXT NOT NULL DEFAULT 'variado');
+    estilo_ia TEXT NOT NULL DEFAULT 'variado',
+    momento TEXT NOT NULL DEFAULT 'antes', dias_desde INTEGER NOT NULL DEFAULT 14,
+    dias_hasta INTEGER NOT NULL DEFAULT 3, cada INTEGER NOT NULL DEFAULT 2,
+    filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
     prueba INTEGER NOT NULL DEFAULT 0, estado TEXT NOT NULL DEFAULT 'generando',
     archivo TEXT, texto TEXT NOT NULL DEFAULT '', foto_id INTEGER,
     con_ia INTEGER NOT NULL DEFAULT 0, aviso TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL,
-    estilo TEXT NOT NULL DEFAULT '');
--- una sola imagen programada por publicación y hora (las pruebas no cuentan)
-CREATE UNIQUE INDEX IF NOT EXISTS generadas_unica ON generadas(publicacion_id, ocurrencia) WHERE prueba = 0;
+    estilo TEXT NOT NULL DEFAULT '', evento_id INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
+-- Eventos leídos de Racecore (origen 'racecore') o creados a mano ('manual').
+-- Solo lo necesario para las publicaciones: nada de datos personales salvo el podio.
+CREATE TABLE IF NOT EXISTS eventos (
+    id INTEGER PRIMARY KEY, origen TEXT NOT NULL, ext_id TEXT NOT NULL,
+    nombre TEXT NOT NULL DEFAULT '', campeonato TEXT NOT NULL DEFAULT '',
+    fecha TEXT NOT NULL DEFAULT '', fecha_txt TEXT NOT NULL DEFAULT '', hora TEXT NOT NULL DEFAULT '',
+    plazas INTEGER, inscritos INTEGER, precio TEXT NOT NULL DEFAULT '', abierta INTEGER NOT NULL DEFAULT 0,
+    enlace TEXT NOT NULL DEFAULT '', web TEXT NOT NULL DEFAULT '', horarios TEXT NOT NULL DEFAULT '',
+    resultados TEXT NOT NULL DEFAULT '', ganadores TEXT NOT NULL DEFAULT '', actualizado TEXT NOT NULL DEFAULT '',
+    UNIQUE (origen, ext_id));
 """
 
 
@@ -143,13 +163,25 @@ def iniciar():
         c.executescript(ESQUEMA)
         # Columnas añadidas en versiones posteriores
         nuevas = {"publicaciones": {"diseno": "TEXT NOT NULL DEFAULT 'cartel'",
-                                    "estilo_ia": "TEXT NOT NULL DEFAULT 'variado'"},
-                  "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''"}}
+                                    "estilo_ia": "TEXT NOT NULL DEFAULT 'variado'",
+                                    "momento": "TEXT NOT NULL DEFAULT 'antes'",
+                                    "dias_desde": "INTEGER NOT NULL DEFAULT 14",
+                                    "dias_hasta": "INTEGER NOT NULL DEFAULT 3",
+                                    "cada": "INTEGER NOT NULL DEFAULT 2",
+                                    "filtro": "TEXT NOT NULL DEFAULT ''",
+                                    "condicion": "TEXT NOT NULL DEFAULT ''"},
+                  "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
+                                "evento_id": "INTEGER NOT NULL DEFAULT 0"}}
         for tabla, cols in nuevas.items():
             existentes = {f["name"] for f in c.execute(f"PRAGMA table_info({tabla})")}
             for col, tipo in cols.items():
                 if col not in existentes:
                     c.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+        # Una sola imagen programada por publicación, evento y hora (las pruebas no cuentan).
+        # Sustituye al índice antiguo, que no tenía en cuenta el evento.
+        c.execute("DROP INDEX IF EXISTS generadas_unica")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS generadas_unica_evento "
+                  "ON generadas(publicacion_id, evento_id, ocurrencia) WHERE prueba = 0")
         c.execute("PRAGMA journal_mode=WAL")
         # Lo que se quedó a medias por un reinicio
         c.execute("UPDATE generadas SET estado = 'error', aviso = 'Interrumpido: se reinició el panel' "
@@ -172,6 +204,8 @@ def hora_de(pub):
 def ocurrencias(pub, desde, hasta):
     """Fechas/horas de publicación entre desde y hasta (ambos incluidos)."""
     h, m = hora_de(pub)
+    if pub["modo"] == "evento":  # esas van con ocurrencias_evento()
+        return []
     if pub["modo"] == "fecha":
         try:
             dias = [date.fromisoformat(pub["fecha"])]
@@ -224,6 +258,11 @@ def cuando_txt(occ):
 
 
 def resumen_programacion(pub):
+    if pub["modo"] == "evento":
+        extra = [CONDICIONES[pub["condicion"]].lower()] if pub["condicion"] in CONDICIONES and pub["condicion"] else []
+        if pub["filtro"]:
+            extra.append(f"solo «{pub['filtro']}»")
+        return " · ".join([f"Eventos: {cuando_evento(pub)}", pub["hora"], *extra])
     if pub["modo"] == "fecha":
         try:
             fecha = date.fromisoformat(pub["fecha"]).strftime("%d/%m/%Y")
@@ -232,6 +271,339 @@ def resumen_programacion(pub):
         return f"{fecha} · {pub['hora']}"
     dias = [DIAS_CORTOS[int(x)] for x in pub["dias"].split(",") if x.strip().isdigit()]
     return f"{' '.join(dias) or 'ningún día'} · {pub['hora']}"
+
+
+# ---------------------------------------------------------------- eventos
+# El panel lee los eventos de Racecore por la red local (solo lectura, con token) y
+# las publicaciones en modo «Eventos» se programan respecto a la fecha de cada uno:
+# «cada 2 días de 14 a 3 días antes», «1 día después»... Los datos del evento
+# ({evento}, {inscritos}, {horarios}...) se ponen en los textos antes de dibujar.
+
+SINCRONIZAR = threading.Lock()
+
+
+class ErrorFuente(Exception):
+    """Fallo al leer Racecore, con un mensaje que se entiende."""
+
+
+def txt(valor):
+    return "" if valor is None else str(valor).strip()
+
+
+def como_entero(valor):
+    try:
+        return max(0, int(valor))
+    except (TypeError, ValueError):
+        return None
+
+
+def leer_fecha(texto):
+    """«2026-10-04», «4/10/2026» o «4 de octubre» -> date. None si no se entiende."""
+    t = txt(texto).lower()
+    if not t:
+        return None
+    try:
+        return date.fromisoformat(t[:10])
+    except ValueError:
+        pass
+    try:
+        m = re.search(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})", t)
+        if m:
+            d, mes, a = map(int, m.groups())
+            return date(a + 2000 if a < 100 else a, mes, d)
+        m = re.search(r"(\d{1,2})\s+(?:de\s+)?([a-z]+)(?:\s+(?:de\s+)?(\d{4}))?", t)
+        if m and m.group(2) in MESES:
+            d, mes = int(m.group(1)), MESES.index(m.group(2)) + 1
+            if m.group(3):
+                return date(int(m.group(3)), mes, d)
+            hoy = date.today()  # sin año: el más cercano que no esté muy pasado
+            f = date(hoy.year, mes, d)
+            return f if f >= hoy - timedelta(days=180) else date(hoy.year + 1, mes, d)
+    except ValueError:
+        pass
+    return None
+
+
+def leer_hora(texto):
+    """«9:00», «09.00» o «9h00» -> «09:00». Vacío si no se entiende."""
+    m = re.match(r"\s*(\d{1,2})[:.h](\d{2})", txt(texto))
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return ""
+
+
+def texto_horarios(horarios):
+    """Horarios de Racecore como texto: una línea por tanda («09:00-09:10 · Entrenos · Cat A»)."""
+    lineas = []
+    for h in horarios:
+        if len(horarios) > 1 and txt(h.get("nombre")):
+            lineas.append(txt(h["nombre"]))
+        for l in h.get("lineas") or []:
+            if not isinstance(l, dict):
+                continue
+            hora, fin = leer_hora(l.get("hora")) or txt(l.get("hora")), leer_hora(l.get("fin"))
+            cats = ", ".join(txt(c) for c in (l.get("cats") or []) if txt(c)) if isinstance(l.get("cats"), list) else ""
+            partes = [f"{hora}-{fin}" if hora and fin else hora, txt(l.get("tipo")), cats, txt(l.get("nota"))]
+            if any(partes):
+                lineas.append(" · ".join(p for p in partes if p))
+    return "\n".join(lineas)
+
+
+def primera_hora(horarios, fecha):
+    """La hora de la primera tanda del día del evento."""
+    horas = [leer_hora(l.get("hora")) for h in horarios
+             if not fecha or leer_fecha(h.get("fecha")) in (None, fecha)
+             for l in (h.get("lineas") or []) if isinstance(l, dict)]
+    horas = [x for x in horas if x]
+    return min(horas) if horas else ""
+
+
+def podio_por_categoria(sesion):
+    """{categoría: [(pos, piloto)]} con los 3 primeros de cada categoría."""
+    cats = {}
+    podio = [p for p in (sesion.get("podio") or []) if isinstance(p, dict) and txt(p.get("piloto"))]
+    for p in sorted(podio, key=lambda p: como_entero(p.get("pos")) or 99):
+        cats.setdefault(txt(p.get("categoria")), []).append((como_entero(p.get("pos")), txt(p["piloto"])))
+    return {c: ps[:3] for c, ps in cats.items()}
+
+
+def texto_resultados(resultados):
+    """«Final\nSenior: 1º Nombre · 2º Nombre · 3º Nombre», una sesión tras otra."""
+    bloques = []
+    for s in resultados:
+        cats = podio_por_categoria(s)
+        if not cats:
+            continue
+        lineas = [txt(s.get("sesion"))]
+        for cat, ps in cats.items():
+            nombres = " · ".join(f"{pos}º {nombre}" if pos else nombre for pos, nombre in ps)
+            lineas.append(f"{cat}: {nombres}" if cat else nombres)
+        bloques.append("\n".join(l for l in lineas if l))
+    return "\n\n".join(bloques)
+
+
+def texto_ganadores(resultados):
+    """Ganador de cada categoría en la última sesión con resultados: «Senior: Nombre | Junior: Nombre»."""
+    for s in reversed(resultados):
+        cats = podio_por_categoria(s)
+        if cats:
+            return " | ".join(f"{cat}: {ps[0][1]}" if cat else ps[0][1] for cat, ps in cats.items())
+    return ""
+
+
+def evento_de_racecore(e):
+    """Del JSON de Racecore solo se guarda lo que hace falta para las publicaciones."""
+    horarios = [h for h in (e.get("horarios") or []) if isinstance(h, dict)]
+    resultados = [r for r in (e.get("resultados") or []) if isinstance(r, dict)]
+    fecha = leer_fecha(e.get("fecha_iso")) or leer_fecha(e.get("fecha"))
+    return {
+        "nombre": txt(e.get("nombre")), "campeonato": txt(e.get("campeonato")),
+        "fecha": fecha.isoformat() if fecha else "", "fecha_txt": txt(e.get("fecha")),
+        "hora": primera_hora(horarios, fecha),
+        "plazas": como_entero(e.get("plazas")), "inscritos": como_entero(e.get("inscritos")),
+        "precio": txt(e.get("precio")), "abierta": 1 if e.get("inscripcion_abierta") else 0,
+        "enlace": txt(e.get("url_inscripcion")), "web": txt(e.get("url_portada")),
+        "horarios": texto_horarios(horarios), "resultados": texto_resultados(resultados),
+        "ganadores": texto_ganadores(resultados),
+    }
+
+
+def url_racecore():
+    """«192.168.1.50» -> «http://192.168.1.50:8100». Vacío si no está configurado."""
+    url = ajuste("racecore_url").strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    partes = urlsplit(url)
+    try:
+        puerto = partes.port
+    except ValueError:
+        puerto = None
+    host = partes.netloc if puerto else f"{partes.hostname}:{RACECORE_PUERTO}"
+    return f"{partes.scheme}://{host}"
+
+
+def leer_racecore():
+    base = url_racecore()
+    try:
+        r = requests.get(f"{base}/api/publico/eventos", headers={"X-Token": ajuste("racecore_token")}, timeout=10)
+    except requests.RequestException:
+        raise ErrorFuente(f"No hay conexión con {base}. Mira que el PC de Racecore esté encendido, "
+                          "en la misma red y con Racecore abierto.") from None
+    if r.status_code == 404:
+        raise ErrorFuente("Racecore todavía no tiene la dirección para el panel (/api/publico/eventos).")
+    if r.status_code == 401:
+        raise ErrorFuente("Racecore dice que el token no es correcto.")
+    if r.status_code == 403:
+        raise ErrorFuente("En Racecore falta generar el token de lectura.")
+    if r.status_code != 200:
+        raise ErrorFuente(f"Racecore ha respondido con un error ({r.status_code}).")
+    try:
+        eventos = r.json()["eventos"]
+    except (ValueError, KeyError, TypeError):
+        eventos = None
+    if not isinstance(eventos, list):
+        raise ErrorFuente("La respuesta de Racecore no tiene el formato esperado.")
+    return [e for e in eventos
+            if isinstance(e, dict) and e.get("id") is not None and e.get("tipo") != "campeonato"]
+
+
+def sincronizar():
+    """Lee Racecore y actualiza la tabla eventos. Devuelve cuántos hay (None si no está configurado)."""
+    if not ajuste("racecore_url"):
+        ESTADO.update(racecore_error="", racecore_n=None)
+        return None
+    with SINCRONIZAR:
+        try:
+            eventos = leer_racecore()
+        except ErrorFuente as e:
+            ESTADO["racecore_error"] = str(e)
+            raise
+        marca = ahora_txt()
+        c = conectar()
+        try:
+            for e in eventos:
+                fila = evento_de_racecore(e) | {"origen": "racecore", "ext_id": str(e["id"]), "actualizado": marca}
+                cols = list(fila)
+                c.execute(f"INSERT INTO eventos ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
+                          f"ON CONFLICT(origen, ext_id) DO UPDATE SET "
+                          f"{', '.join(f'{k} = excluded.{k}' for k in cols)}", [fila[k] for k in cols])
+            # Los que ya no manda Racecore (borrados, o pasados hace días) se quitan
+            c.execute("DELETE FROM eventos WHERE origen = 'racecore' AND actualizado != ?", (marca,))
+            c.commit()
+        finally:
+            c.close()
+        ESTADO.update(racecore_ok=datetime.now(), racecore_error="", racecore_n=len(eventos))
+        return len(eventos)
+
+
+def sincronizar_seguro():
+    """Para el programador: si Racecore falla se queda anotado y se siguen usando los últimos datos."""
+    try:
+        sincronizar()
+    except ErrorFuente as e:
+        log.warning("Racecore: %s", e)
+    except Exception as e:
+        ESTADO["racecore_error"] = f"Error leyendo Racecore: {e}"
+        log.exception("Racecore")
+
+
+def desfases(pub):
+    """Días respecto al evento en los que toca publicar (negativo = antes)."""
+    if pub["momento"] == "dia":
+        return [0]
+    cada = max(1, pub["cada"] or 1)
+    cerca, lejos = sorted((max(0, pub["dias_desde"]), max(0, pub["dias_hasta"])))
+    if pub["momento"] == "despues":
+        return list(range(cerca, lejos + 1, cada))
+    return [-d for d in range(lejos, cerca - 1, -cada)]
+
+
+def cuando_evento(pub):
+    """«cada 2 días, de 14 a 3 días antes», «1 día después»..."""
+    if pub["momento"] == "dia":
+        return "el mismo día"
+    cerca, lejos = sorted((pub["dias_desde"], pub["dias_hasta"]))
+    lado = "después" if pub["momento"] == "despues" else "antes"
+    if cerca == lejos:
+        return f"{cerca} día{'' if cerca == 1 else 's'} {lado}"
+    rango = f"de {cerca} a {lejos}" if lado == "después" else f"de {lejos} a {cerca}"
+    cada = "cada día" if pub["cada"] <= 1 else f"cada {pub['cada']} días"
+    return f"{cada}, {rango} días {lado}"
+
+
+def eventos_de(pub, eventos=None):
+    """Eventos a los que se aplica la publicación: todos, o los que contienen el filtro."""
+    eventos = consulta("SELECT * FROM eventos") if eventos is None else eventos
+    filtro = (pub["filtro"] or "").strip().casefold()
+    return [e for e in eventos if not filtro or filtro in f"{e['nombre']} {e['campeonato']}".casefold()]
+
+
+def ocurrencias_evento(pub, desde, hasta, eventos=None):
+    """[(fecha y hora de publicación, evento)] entre desde y hasta, ordenadas."""
+    h, m = hora_de(pub)
+    res = []
+    for ev in eventos_de(pub, eventos):
+        f = leer_fecha(ev["fecha"])
+        if not f:
+            continue
+        for d in desfases(pub):
+            dia = f + timedelta(days=d)
+            occ = datetime(dia.year, dia.month, dia.day, h, m)
+            if desde <= occ <= hasta:
+                res.append((occ, ev))
+    return sorted(res, key=lambda x: (x[0], x[1]["id"]))
+
+
+def proxima_evento(pub, ahora=None):
+    occ = ocurrencias_evento(pub, ahora or datetime.now(), datetime.max)
+    return occ[0] if occ else (None, None)
+
+
+def prueba_evento(pub):
+    """Para «Generar ahora»: la próxima publicación con su evento, o la última si ya pasaron todas."""
+    todas = ocurrencias_evento(pub, datetime.min, datetime.max)
+    futuras = [x for x in todas if x[0] >= datetime.now() - GRACIA]
+    return futuras[0] if futuras else (todas[-1] if todas else (None, None))
+
+
+def plazas_libres(ev):
+    if ev["plazas"] and ev["inscritos"] is not None:
+        return max(0, ev["plazas"] - ev["inscritos"])
+    return None
+
+
+def cumple(pub, ev):
+    """La condición de la publicación: inscripción abierta, plazas libres o resultados."""
+    if pub["condicion"] == "abierta":
+        return bool(ev["abierta"])
+    if pub["condicion"] == "plazas":
+        libres = plazas_libres(ev)
+        return libres is None or libres > 0
+    if pub["condicion"] == "resultados":
+        return bool(ev["resultados"].strip())
+    return True
+
+
+def valores_evento(ev, occ):
+    """Variables de los textos de una publicación de eventos ({dia}, {fecha} y {hora} son las del evento)."""
+    f = leer_fecha(ev["fecha"])
+    dias = (f - occ.date()).days if f else None
+    if dias is None:
+        faltan = ""
+    elif dias in (0, 1, -1):
+        faltan = {0: "hoy", 1: "mañana", -1: "ayer"}[dias]
+    else:
+        faltan = f"en {dias} días" if dias > 0 else f"hace {-dias} días"
+    numero = lambda v: "" if v is None else str(v)  # noqa: E731
+    return {
+        "{evento}": ev["nombre"], "{campeonato}": ev["campeonato"],
+        "{dia}": DIAS[f.weekday()] if f else "",
+        "{fecha}": f"{f.day} de {MESES[f.month - 1]}" if f else ev["fecha_txt"],
+        "{hora}": ev["hora"], "{dias}": numero(abs(dias) if dias is not None else None), "{faltan}": faltan,
+        "{inscritos}": numero(ev["inscritos"]), "{plazas}": numero(ev["plazas"]),
+        "{libres}": numero(plazas_libres(ev)), "{precio}": ev["precio"],
+        "{enlace}": ev["enlace"] or ev["web"], "{web}": ev["web"] or ev["enlace"],
+        "{horarios}": ev["horarios"], "{resultados}": ev["resultados"], "{ganadores}": ev["ganadores"],
+    }
+
+
+def con_evento(pub, ev, occ):
+    """La publicación con los datos del evento ya puestos en sus textos."""
+    valores = valores_evento(ev, occ)
+    datos = dict(pub)
+    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia"):
+        for clave, valor in valores.items():
+            datos[campo] = (datos[campo] or "").replace(clave, valor or "")
+    datos["nombre"] = f"{pub['nombre']} · {ev['nombre']}"
+    datos["_aviso"] = ""
+    if ev["origen"] == "racecore" and ev["actualizado"]:
+        leido = datetime.strptime(ev["actualizado"], "%Y-%m-%d %H:%M:%S")
+        if datetime.now() - leido > timedelta(hours=3):
+            datos["_aviso"] = (f"Ojo: datos de Racecore del {leido:%d/%m %H:%M} (no se han podido actualizar). "
+                               "Revisa los números antes de publicar.")
+    return datos
 
 
 # ---------------------------------------------------------------- imagen
@@ -861,10 +1233,11 @@ def componer(pub, occ, evitar=None, evitar_estilo=None):
 
 # ---------------------------------------------------------------- generación y programador
 
-def reclamar(pub_id, occ, prueba):
+def reclamar(pub_id, occ, prueba, evento_id=0):
     """Crea la fila «generando». Devuelve su id, o None si esa hora ya estaba generada."""
-    cur = ejecutar("INSERT OR IGNORE INTO generadas (publicacion_id, ocurrencia, prueba, creada) "
-                   "VALUES (?, ?, ?, ?)", (pub_id, occ.strftime("%Y-%m-%d %H:%M"), int(prueba), ahora_txt()))
+    cur = ejecutar("INSERT OR IGNORE INTO generadas (publicacion_id, evento_id, ocurrencia, prueba, creada) "
+                   "VALUES (?, ?, ?, ?, ?)",
+                   (pub_id, evento_id, occ.strftime("%Y-%m-%d %H:%M"), int(prueba), ahora_txt()))
     return cur.lastrowid if cur.rowcount else None
 
 
@@ -876,6 +1249,8 @@ def generar(gen_id, pub, occ, enviar=False):
         archivo = f"{pub['id']}_{occ:%Y%m%d_%H%M}_{gen_id}_{uuid.uuid4().hex[:6]}.jpg"
         img.save(DIR_GEN / archivo, "JPEG", quality=92, optimize=True)
         texto = variables(pub["texto"], occ)
+        if "_aviso" in pub.keys():  # publicaciones de eventos: p. ej. datos de Racecore sin actualizar
+            aviso = " ".join(a for a in (pub["_aviso"], aviso) if a)
         cur = ejecutar("UPDATE generadas SET estado = 'lista', archivo = ?, texto = ?, foto_id = ?, con_ia = ?, "
                        "aviso = ?, estilo = ? WHERE id = ? AND estado = 'generando'",
                        (archivo, texto, foto_id, int(con_ia), aviso, estilo, gen_id))
@@ -894,6 +1269,7 @@ def generar(gen_id, pub, occ, enviar=False):
 
 
 def en_segundo_plano(gen_id, pub, occ):
+    """pub ya con los datos del evento puestos (con_evento), si es de eventos."""
     threading.Thread(target=generar, args=(gen_id, pub, occ), daemon=True).start()
 
 
@@ -916,8 +1292,19 @@ def avisar_telegram(ruta, pub, occ, texto):
 def comprobar(ahora=None):
     """Genera lo que toque: desde «antelación» minutos antes de la hora hasta poco después."""
     ahora = ahora or datetime.now()
+    eventos = None
     for pub in consulta("SELECT * FROM publicaciones WHERE activa = 1"):
         antelacion = timedelta(minutes=max(0, pub["antelacion"]))
+        if pub["modo"] == "evento":
+            if eventos is None:
+                eventos = consulta("SELECT * FROM eventos")
+            for occ, ev in ocurrencias_evento(pub, ahora - GRACIA, ahora + antelacion, eventos):
+                # si no se cumple la condición (p. ej. aún no hay resultados) se vuelve a mirar después
+                if cumple(pub, ev):
+                    gen_id = reclamar(pub["id"], occ, prueba=False, evento_id=ev["id"])
+                    if gen_id:
+                        generar(gen_id, con_evento(pub, ev, occ), occ, enviar=True)
+            continue
         for occ in ocurrencias(pub, ahora - GRACIA, ahora + antelacion):
             if occ > ahora - GRACIA:
                 gen_id = reclamar(pub["id"], occ, prueba=False)
@@ -935,7 +1322,11 @@ def limpiar_antiguas():
 
 def programador():
     ultimo_limpiado = None
+    ultima_lectura = None
     while True:
+        if ultima_lectura is None or time.monotonic() - ultima_lectura >= CADA_SINCRONIZAR:
+            ultima_lectura = time.monotonic()
+            sincronizar_seguro()
         try:
             comprobar()
             if ultimo_limpiado != date.today():
@@ -973,10 +1364,12 @@ def archivo(carpeta, nombre):
 @app.route("/")
 def listas():
     filas = consulta("""
-        SELECT g.*, p.nombre FROM generadas g LEFT JOIN publicaciones p ON p.id = g.publicacion_id
+        SELECT g.*, p.nombre, e.nombre AS evento FROM generadas g
+        LEFT JOIN publicaciones p ON p.id = g.publicacion_id LEFT JOIN eventos e ON e.id = g.evento_id
         WHERE g.estado IN ('generando', 'lista', 'error') ORDER BY g.ocurrencia, g.id""")
     hechas = consulta("""
-        SELECT g.*, p.nombre FROM generadas g LEFT JOIN publicaciones p ON p.id = g.publicacion_id
+        SELECT g.*, p.nombre, e.nombre AS evento FROM generadas g
+        LEFT JOIN publicaciones p ON p.id = g.publicacion_id LEFT JOIN eventos e ON e.id = g.evento_id
         WHERE g.estado = 'publicada' ORDER BY g.ocurrencia DESC LIMIT 12""")
 
     def preparar(g):
@@ -1010,8 +1403,16 @@ def otra_foto(gen_id):
     if not pub:
         flash("Esa publicación ya no existe.", "error")
         return redirect(url_for("listas"))
+    occ = datetime.strptime(g["ocurrencia"], "%Y-%m-%d %H:%M")
+    pub = pub[0]
+    if g["evento_id"]:  # se rehace con los datos del evento de ahora (inscritos, resultados...)
+        ev = consulta("SELECT * FROM eventos WHERE id = ?", (g["evento_id"],))
+        if not ev:
+            flash("Ese evento ya no está en el panel.", "error")
+            return redirect(url_for("listas"))
+        pub = con_evento(pub, ev[0], occ)
     ejecutar("UPDATE generadas SET estado = 'generando', aviso = '' WHERE id = ?", (gen_id,))
-    en_segundo_plano(gen_id, pub[0], datetime.strptime(g["ocurrencia"], "%Y-%m-%d %H:%M"))
+    en_segundo_plano(gen_id, pub, occ)
     return redirect(url_for("listas"))
 
 
@@ -1030,7 +1431,8 @@ def borrar_generada(gen_id):
 NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "fecha": "",
          "hora": "18:00", "antelacion": 1440, "categoria_id": None, "formato": "post",
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
-         "diseno": "cartel", "estilo_ia": "variado"}
+         "diseno": "cartel", "estilo_ia": "variado",
+         "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": ""}
 
 
 @app.route("/publicaciones")
@@ -1038,13 +1440,15 @@ def publicaciones():
     cats = {c["id"]: c["nombre"] for c in consulta("SELECT * FROM categorias")}
     filas = []
     for p in consulta("SELECT * FROM publicaciones ORDER BY activa DESC, nombre"):
-        occ = proxima(p) if p["activa"] else None
+        occ, ev = None, None
+        if p["activa"]:
+            occ, ev = proxima_evento(p) if p["modo"] == "evento" else (proxima(p), None)
         genera = occ - timedelta(minutes=p["antelacion"]) if occ else None
         filas.append(dict(p) | {
             "programacion": resumen_programacion(p),
             "categoria": cats.get(p["categoria_id"], "sin categoría"),
             "formato_txt": FORMATOS.get(p["formato"], FORMATOS["post"])[0],
-            "proxima": cuando_txt(occ) if occ else "",
+            "proxima": (cuando_txt(occ) + (f" · {ev['nombre']}" if ev else "")) if occ else "",
             "genera": genera.strftime("%d/%m %H:%M") if genera else "",
         })
     return render_template("publicaciones.html", filas=filas)
@@ -1068,13 +1472,19 @@ def leer_formulario():
         categoria_id = int(f.get("categoria_id") or 0) or None
     except ValueError:
         categoria_id = None
+
+    def entero(nombre, defecto, minimo, maximo):
+        try:
+            return min(maximo, max(minimo, int(f.get(nombre) or defecto)))
+        except ValueError:
+            return defecto
     color = f.get("color", "#e10600").strip()
     if not (len(color) == 7 and color.startswith("#")):
         color = "#e10600"
     datos = {
         "nombre": f.get("nombre", "").strip() or "Sin nombre",
         "activa": 1 if f.get("activa") else 0,
-        "modo": "fecha" if f.get("modo") == "fecha" else "semanal",
+        "modo": f.get("modo") if f.get("modo") in ("fecha", "evento") else "semanal",
         "dias": ",".join(dias),
         "fecha": f.get("fecha", "").strip(),
         "hora": hora,
@@ -1089,6 +1499,12 @@ def leer_formulario():
         "prompt_ia": f.get("prompt_ia", "").strip(),
         "diseno": f.get("diseno") if f.get("diseno") in ("sencillo", "ia") else "cartel",
         "estilo_ia": f.get("estilo_ia") if f.get("estilo_ia") in ia_fondo.ESTILOS else "variado",
+        "momento": f.get("momento") if f.get("momento") in MOMENTOS else "antes",
+        "dias_desde": entero("dias_desde", 14, 0, 365),
+        "dias_hasta": entero("dias_hasta", 3, 0, 365),
+        "cada": entero("cada", 1, 1, 60),
+        "filtro": f.get("filtro", "").strip(),
+        "condicion": f.get("condicion") if f.get("condicion") in CONDICIONES else "",
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
@@ -1104,6 +1520,8 @@ def leer_formulario():
 @app.route("/publicaciones/<int:pub_id>", methods=["GET", "POST"])
 def editar_publicacion(pub_id=None):
     pub = dict(pub_o_404(pub_id)) if pub_id else dict(NUEVA)
+    if not pub_id and request.args.get("modo") == "evento":
+        pub["modo"] = "evento"
     if request.method == "POST":
         datos, errores = leer_formulario()
         if errores:
@@ -1126,12 +1544,21 @@ def editar_publicacion(pub_id=None):
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
                            dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")),
-                           estilos=ia_fondo.ESTILOS)
+                           estilos=ia_fondo.ESTILOS, momentos=MOMENTOS, condiciones=CONDICIONES)
 
 
 @app.post("/publicaciones/<int:pub_id>/generar")
 def generar_ahora(pub_id):
     pub = pub_o_404(pub_id)
+    if pub["modo"] == "evento":
+        occ, ev = prueba_evento(pub)
+        if not ev:
+            flash("No hay ningún evento con fecha para probar esta publicación. Mira la pestaña Eventos.", "error")
+            return redirect(url_for("publicaciones"))
+        en_segundo_plano(reclamar(pub_id, occ, prueba=True, evento_id=ev["id"]), con_evento(pub, ev, occ), occ)
+        flash(f"Generando «{pub['nombre']}» con el evento «{ev['nombre']}» ({cuando_txt(occ)})… "
+              "aparecerá aquí en unos segundos.", "ok")
+        return redirect(url_for("listas"))
     occ = ocurrencia_prueba(pub)
     en_segundo_plano(reclamar(pub_id, occ, prueba=True), pub, occ)
     flash(f"Generando «{pub['nombre']}»… aparecerá aquí en unos segundos"
@@ -1151,6 +1578,170 @@ def borrar_publicacion(pub_id):
     pub_o_404(pub_id)
     ejecutar("DELETE FROM publicaciones WHERE id = ?", (pub_id,))
     flash("Publicación borrada.", "ok")
+    return redirect(url_for("publicaciones"))
+
+
+# --- Eventos
+
+def estado_racecore():
+    ok = ESTADO["racecore_ok"]
+    return {"configurado": bool(ajuste("racecore_url")), "url": url_racecore(), "error": ESTADO["racecore_error"],
+            "ok": ok.strftime("%d/%m %H:%M") if ok else "", "n": ESTADO["racecore_n"]}
+
+
+def leer_ahora():
+    """Lee Racecore ahora mismo y lo cuenta con un mensaje."""
+    try:
+        n = sincronizar()
+        if n is None:
+            flash("Racecore no está configurado: pon su dirección y el token en Ajustes.", "error")
+        else:
+            flash(f"Racecore: {n} evento(s) leído(s).", "ok")
+    except ErrorFuente as e:
+        flash(f"Racecore: {e}", "error")
+    except Exception as e:
+        log.exception("Racecore")
+        flash(f"Error leyendo Racecore: {e}", "error")
+
+
+@app.route("/eventos")
+def eventos():
+    ahora = datetime.now()
+    hoy = ahora.date()
+    reglas = consulta("SELECT * FROM publicaciones WHERE modo = 'evento' AND activa = 1")
+    filas = []
+    for ev in consulta("SELECT * FROM eventos"):
+        f = leer_fecha(ev["fecha"])
+        if f and f < hoy - timedelta(days=30):
+            continue
+        proximas = sorted((occ, r["nombre"], CONDICIONES[r["condicion"]].lower() if r["condicion"] in CONDICIONES
+                           and r["condicion"] else "")
+                          for r in reglas for occ, _ in ocurrencias_evento(r, ahora - GRACIA, datetime.max, [ev]))
+        libres = plazas_libres(ev)
+        if ev["plazas"]:
+            inscritos = f"{ev['inscritos'] if ev['inscritos'] is not None else '?'} de {ev['plazas']}"
+            inscritos += f" (quedan {libres})" if libres is not None else ""
+        else:
+            inscritos = txt(ev["inscritos"]) or "—"
+        filas.append(dict(ev) | {
+            "orden": (0, f.toordinal()) if f and f >= hoy else ((1, -f.toordinal()) if f else (2, 0)),
+            "cuando": f"{DIAS[f.weekday()]} {f:%d/%m/%Y}" + (f" · {ev['hora']}" if ev["hora"] else "") if f else "",
+            "pasado": bool(f and f < hoy), "inscritos_txt": inscritos,
+            "proximas": [(cuando_txt(o), n, c) for o, n, c in proximas[:8]],
+        })
+    filas.sort(key=lambda e: e["orden"])
+    hay_reglas = bool(consulta("SELECT 1 FROM publicaciones WHERE modo = 'evento' LIMIT 1"))
+    return render_template("eventos.html", eventos=filas, racecore=estado_racecore(), hay_reglas=hay_reglas,
+                           hay_activas=bool(reglas))
+
+
+@app.post("/eventos/leer")
+def leer_eventos():
+    leer_ahora()
+    return redirect(url_for("ajustes") if request.form.get("volver") == "ajustes" else url_for("eventos"))
+
+
+EVENTO_NUEVO = {"id": None, "nombre": "", "campeonato": "", "fecha": "", "hora": "", "plazas": None,
+                "inscritos": None, "precio": "", "abierta": 1, "enlace": "", "web": "", "horarios": "",
+                "resultados": "", "ganadores": ""}
+
+
+def evento_manual_o_404(ev_id):
+    fila = consulta("SELECT * FROM eventos WHERE id = ? AND origen = 'manual'", (ev_id,))
+    if not fila:
+        abort(404)
+    return fila[0]
+
+
+@app.route("/eventos/nuevo", methods=["GET", "POST"])
+@app.route("/eventos/<int:ev_id>", methods=["GET", "POST"])
+def editar_evento(ev_id=None):
+    """Eventos a mano: para lo que no está en Racecore (o mientras no esté conectado)."""
+    ev = dict(evento_manual_o_404(ev_id)) if ev_id else dict(EVENTO_NUEVO)
+    if request.method == "POST":
+        f = request.form
+        datos = {
+            "nombre": f.get("nombre", "").strip() or "Sin nombre", "campeonato": f.get("campeonato", "").strip(),
+            "fecha": f.get("fecha", "").strip(), "hora": leer_hora(f.get("hora")),
+            "plazas": como_entero(f.get("plazas")), "inscritos": como_entero(f.get("inscritos")),
+            "precio": f.get("precio", "").strip(), "abierta": 1 if f.get("abierta") else 0,
+            "enlace": f.get("enlace", "").strip(), "web": f.get("web", "").strip(),
+            "horarios": f.get("horarios", "").strip().replace("\r", ""),
+            "resultados": f.get("resultados", "").strip().replace("\r", ""),
+            "ganadores": f.get("ganadores", "").strip(), "actualizado": ahora_txt(),
+        }
+        if not leer_fecha(datos["fecha"]):
+            flash("Pon la fecha del evento.", "error")
+            ev.update(datos)
+        else:
+            campos = list(datos)
+            if ev_id:
+                ejecutar(f"UPDATE eventos SET {', '.join(c + ' = ?' for c in campos)} WHERE id = ?",
+                         [datos[c] for c in campos] + [ev_id])
+            else:
+                datos |= {"origen": "manual", "ext_id": uuid.uuid4().hex}
+                campos = list(datos)
+                ejecutar(f"INSERT INTO eventos ({', '.join(campos)}) VALUES ({', '.join('?' for _ in campos)})",
+                         [datos[c] for c in campos])
+            flash("Evento guardado.", "ok")
+            return redirect(url_for("eventos"))
+    return render_template("evento.html", ev=ev)
+
+
+@app.post("/eventos/<int:ev_id>/borrar")
+def borrar_evento(ev_id):
+    evento_manual_o_404(ev_id)
+    ejecutar("DELETE FROM eventos WHERE id = ?", (ev_id,))
+    flash("Evento borrado.", "ok")
+    return redirect(url_for("eventos"))
+
+
+# Campaña de ejemplo: se crean en pausa para revisarlas antes de activarlas
+EJEMPLOS = [
+    {"nombre": "Evento · Recordatorio", "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2,
+     "hora": "19:00", "condicion": "abierta",
+     "titulo": "¡QUEDAN\n*{dias} DÍAS!*", "subtitulo": "{evento}\n¡Apúntate ya!",
+     "pie": "{dia} {fecha} | {inscritos} inscritos | {precio}",
+     "texto": "🏁 {evento} es {faltan}: {dia} {fecha}.\n\nYa hay {inscritos} pilotos inscritos. "
+              "¿Te lo vas a perder?\n\n👉 Inscripciones: {enlace}"},
+    {"nombre": "Evento · Llamada a la acción", "momento": "antes", "dias_desde": 10, "dias_hasta": 10, "cada": 1,
+     "hora": "12:00", "condicion": "abierta",
+     "titulo": "¿TE LO VAS A\n*PERDER?*", "subtitulo": "{evento}\nInscripción abierta",
+     "pie": "{dia} {fecha} | {precio}",
+     "texto": "🔥 Solo quedan {dias} días para {evento} ({dia} {fecha}).\n\n"
+              "Las inscripciones están abiertas. ¡Reserva tu plaza!\n\n👉 {enlace}"},
+    {"nombre": "Evento · Horarios", "momento": "antes", "dias_desde": 2, "dias_hasta": 2, "cada": 1,
+     "hora": "19:00", "condicion": "",
+     "titulo": "*HORARIOS*", "subtitulo": "{evento}\n{dia} {fecha}", "pie": "Empezamos a las {hora}",
+     "texto": "⏱️ Horarios de {evento} ({dia} {fecha}):\n\n{horarios}\n\n¡Nos vemos en pista!"},
+    {"nombre": "Evento · Inscritos", "momento": "antes", "dias_desde": 1, "dias_hasta": 1, "cada": 1,
+     "hora": "19:00", "condicion": "",
+     "titulo": "*{inscritos}*\nPILOTOS", "subtitulo": "{evento}\n¡Es {faltan}!",
+     "pie": "{dia} {fecha} | Desde las {hora}",
+     "texto": "✅ ¡Todo listo! {inscritos} pilotos para {evento}, {faltan}.\n\n"
+              "📋 Lista de inscritos y horarios: {web}"},
+    {"nombre": "Evento · Resultados", "momento": "despues", "dias_desde": 1, "dias_hasta": 1, "cada": 1,
+     "hora": "10:00", "antelacion": 600, "condicion": "resultados",
+     "titulo": "*RESULTADOS*", "subtitulo": "{evento}\n¡Enhorabuena!", "pie": "{ganadores}",
+     "texto": "🏆 Resultados de {evento}:\n\n{resultados}\n\n"
+              "¡Gracias a todos por participar! Clasificación completa: {web}"},
+]
+
+
+@app.post("/eventos/ejemplos")
+def crear_ejemplos():
+    creadas = 0
+    for ejemplo in EJEMPLOS:
+        if consulta("SELECT 1 FROM publicaciones WHERE nombre = ?", (ejemplo["nombre"],)):
+            continue
+        datos = {k: v for k, v in NUEVA.items() if k != "id"} | {
+            "modo": "evento", "activa": 0, "formato": "vertical"} | ejemplo
+        campos = list(datos)
+        ejecutar(f"INSERT INTO publicaciones ({', '.join(campos)}) VALUES ({', '.join('?' for _ in campos)})",
+                 [datos[c] for c in campos])
+        creadas += 1
+    flash(f"He creado {creadas} publicación(es) de ejemplo en pausa. Edítalas, elige la categoría de fotos, "
+          "prueba con «Generar ahora» y actívalas." if creadas else "Las publicaciones de ejemplo ya existían.", "ok")
     return redirect(url_for("publicaciones"))
 
 
@@ -1267,7 +1858,9 @@ def borrar_categoria(cat_id):
 @app.route("/ajustes", methods=["GET", "POST"])
 def ajustes():
     if request.method == "POST":
-        for clave in ("openai_key", "telegram_token"):
+        antes = (ajuste("racecore_url"), ajuste("racecore_token"))
+        guardar_ajuste("racecore_url", request.form.get("racecore_url", "").strip())
+        for clave in ("openai_key", "telegram_token", "racecore_token"):
             nuevo = request.form.get(clave, "").strip()
             if request.form.get(f"quitar_{clave}"):
                 guardar_ajuste(clave, "")
@@ -1279,6 +1872,8 @@ def ajustes():
         calidad = request.form.get("openai_calidad", "medium")
         guardar_ajuste("openai_calidad", calidad if calidad in ("low", "medium", "high") else "medium")
         flash("Ajustes guardados.", "ok")
+        if ajuste("racecore_url") and (ajuste("racecore_url"), ajuste("racecore_token")) != antes:
+            leer_ahora()  # se prueba la conexión nueva enseguida
         return redirect(url_for("ajustes"))
 
     def oculta(clave):
@@ -1288,6 +1883,7 @@ def ajustes():
     ultima = ESTADO["ultima_comprobacion"]
     return render_template(
         "ajustes.html", openai_key=oculta("openai_key"), telegram_token=oculta("telegram_token"),
+        racecore_url=ajuste("racecore_url"), racecore_token=oculta("racecore_token"), racecore=estado_racecore(),
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
         ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
         marcas_v={t: int(r.stat().st_mtime) if r.exists() else 0 for t, (r, _) in MARCAS.items()},
@@ -1378,6 +1974,7 @@ PLANTILLAS["base.html"] = """<!doctype html>
 <style>
 :root { --fondo:#111214; --caja:#1b1c20; --borde:#2c2e34; --texto:#eceff4; --suave:#9aa0ab; --acento:#e10600; --ok:#2e9d5b; }
 * { box-sizing:border-box; }
+[hidden] { display:none !important; }
 body { margin:0; background:var(--fondo); color:var(--texto); font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 a { color:inherit; }
 nav { display:flex; gap:4px; align-items:center; padding:10px 16px; background:#000; position:sticky; top:0; z-index:5; overflow-x:auto; }
@@ -1400,6 +1997,7 @@ label { display:block; margin:14px 0 5px; color:var(--suave); font-size:13px; }
 .ayuda { color:var(--suave); font-size:13px; margin-top:4px; }
 .chip { display:inline-block; font-size:12px; padding:2px 8px; border-radius:99px; background:#2c2e34; color:var(--suave); margin-left:4px; }
 .chip.ia { background:#3b2a6b; color:#d7c8ff; } .chip.on { background:#193d29; color:#8fe0b0; } .chip.prueba { background:#4a3b12; color:#ffd98a; }
+.chip.error { background:#4a1717; color:#ff8a80; }
 .mensaje { padding:10px 14px; border-radius:8px; margin-bottom:12px; background:#193d29; }
 .mensaje.error { background:#4a1717; }
 .aviso { background:#3a2f12; color:#ffd98a; border-radius:8px; padding:8px 10px; font-size:13px; margin:8px 0; }
@@ -1410,6 +2008,7 @@ label { display:block; margin:14px 0 5px; color:var(--suave); font-size:13px; }
 <nav><b>RACE<span>CORE</span> · Redes</b>
   <a href="{{ url_for('listas') }}" class="{{ 'activo' if request.endpoint == 'listas' }}">Listas para publicar</a>
   <a href="{{ url_for('publicaciones') }}" class="{{ 'activo' if 'publicacion' in request.endpoint }}">Publicaciones</a>
+  <a href="{{ url_for('eventos') }}" class="{{ 'activo' if 'evento' in request.endpoint }}">Eventos</a>
   <a href="{{ url_for('fotos') }}" class="{{ 'activo' if request.endpoint in ('fotos', 'categoria') }}">Fotos</a>
   <a href="{{ url_for('ajustes') }}" class="{{ 'activo' if request.endpoint == 'ajustes' }}">Ajustes</a>
 </nav>
@@ -1437,7 +2036,7 @@ PLANTILLAS["listas.html"] = """{% extends "base.html" %}
     {% else %}<div class="hueco">No se pudo generar</div>{% endif %}
   </div>
   <div>
-    <b>{{ g.nombre }}</b>
+    <b>{{ g.nombre }}</b>{% if g.evento %} · {{ g.evento }}{% endif %}
     {% if g.prueba %}<span class="chip prueba">Prueba</span>{% endif %}
     {% if g.con_ia %}<span class="chip ia">IA{{ ' · ' ~ g.estilo_nombre if g.estilo_nombre }}</span>{% endif %}
     <div class="ayuda">Publicar: {{ g.cuando }}</div>
@@ -1464,7 +2063,7 @@ PLANTILLAS["listas.html"] = """{% extends "base.html" %}
 {% if hechas %}
 <h2>Publicadas hace poco</h2>
 <div class="rejilla">
-{% for g in hechas %}<a href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" target="_blank" title="{{ g.nombre }} · {{ g.cuando }}"><img loading="lazy" src="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" alt=""></a>{% endfor %}
+{% for g in hechas %}<a href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" target="_blank" title="{{ g.nombre }}{{ ' · ' ~ g.evento if g.evento }} · {{ g.cuando }}"><img loading="lazy" src="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" alt=""></a>{% endfor %}
 </div>
 {% endif %}
 
@@ -1501,10 +2100,11 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
     <div>
       <b>{{ p.nombre }}</b>
       {% if p.activa %}<span class="chip on">Activa</span>{% else %}<span class="chip">Pausada</span>{% endif %}
+      {% if p.modo == 'evento' %}<span class="chip">Eventos</span>{% endif %}
       {% if p.prompt_ia %}<span class="chip ia">IA</span>{% endif %}
       <div class="ayuda">{{ p.programacion }} · {{ p.formato_txt }} · fotos: {{ p.categoria }}</div>
       {% if p.proxima %}<div class="ayuda">Próxima: <b>{{ p.proxima }}</b> (la imagen se prepara el {{ p.genera }})</div>
-      {% elif p.activa %}<div class="ayuda">Sin próximas fechas.</div>{% endif %}
+      {% elif p.activa %}<div class="ayuda">{{ 'Sin eventos próximos.' if p.modo == 'evento' else 'Sin próximas fechas.' }}</div>{% endif %}
     </div>
     <div class="fila">
       <a class="boton" href="{{ url_for('editar_publicacion', pub_id=p.id) }}">Editar</a>
@@ -1524,6 +2124,7 @@ PLANTILLAS["publicacion.html"] = """{% extends "base.html" %}
 <h1>{{ 'Editar publicación' if pub.id else 'Nueva publicación' }}</h1>
 <style>
 .dos { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
+.tres { display:grid; grid-template-columns:1fr 1fr 1fr; gap:0 16px; }
 @media (max-width:640px) { .dos { grid-template-columns:1fr; } }
 .dias label { display:inline-flex; gap:4px; align-items:center; margin:6px 10px 0 0; color:var(--texto); font-size:15px; }
 .opciones label { display:inline-flex; gap:6px; align-items:center; margin:6px 16px 0 0; color:var(--texto); font-size:15px; }
@@ -1541,11 +2142,31 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <div class="opciones">
     <label><input type="radio" name="modo" value="semanal" {{ 'checked' if pub.modo != 'fecha' }}> Días de la semana</label>
     <label><input type="radio" name="modo" value="fecha" {{ 'checked' if pub.modo == 'fecha' }}> Fecha concreta</label>
+    <label><input type="radio" name="modo" value="evento" {{ 'checked' if pub.modo == 'evento' }}> Eventos</label>
   </div>
   <div id="semanal" class="dias">
     {% for d in dias %}<label><input type="checkbox" name="dias" value="{{ loop.index0 }}" {{ 'checked' if loop.index0|string in dias_marcados }}> {{ d }}</label>{% endfor %}
   </div>
   <div id="fecha"><label>Fecha</label><input type="date" name="fecha" value="{{ pub.fecha }}"></div>
+  <div id="evento">
+    <div class="ayuda">Se publica sola para cada evento de la pestaña Eventos (los de Racecore y los creados a mano).</div>
+    <div class="dos">
+      <div><label>¿Cuándo, respecto al evento?</label>
+        <select name="momento">{% for clave, t in momentos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.momento }}>{{ t }}</option>{% endfor %}</select></div>
+      <div><label>Condición</label>
+        <select name="condicion">{% for clave, t in condiciones.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.condicion }}>{{ t }}</option>{% endfor %}</select></div>
+    </div>
+    <div id="rango">
+      <div class="tres">
+        <div><label>Desde (días)</label><input type="number" name="dias_desde" min="0" max="365" value="{{ pub.dias_desde }}"></div>
+        <div><label>Hasta (días)</label><input type="number" name="dias_hasta" min="0" max="365" value="{{ pub.dias_hasta }}"></div>
+        <div><label>Cada (días)</label><input type="number" name="cada" min="1" max="60" value="{{ pub.cada }}"></div>
+      </div>
+      <div class="ayuda">Ej.: antes, de 14 a 3, cada 2 → se publica a 14, 12, 10, 8, 6 y 4 días del evento. Para un solo día pon el mismo número: de 10 a 10. Al día siguiente: después, de 1 a 1.</div>
+    </div>
+    <label>Solo los eventos que contengan (opcional)</label>
+    <input type="text" name="filtro" value="{{ pub.filtro }}" placeholder="Ej: Resistencia. Vacío = todos los eventos">
+  </div>
   <div class="dos">
     <div><label>Hora de publicación</label><input type="time" name="hora" value="{{ pub.hora }}" required></div>
     <div><label>Preparar la imagen con antelación (minutos)</label><input type="number" name="antelacion" min="0" max="10080" value="{{ pub.antelacion }}"></div>
@@ -1599,7 +2220,10 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 <div class="caja">
   <b>Texto del post</b>
   <textarea name="texto" style="min-height:140px" placeholder="El texto que pegarás en Instagram/Facebook">{{ pub.texto }}</textarea>
-  <div class="ayuda">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00).</div>
+  <div class="ayuda" id="vars_normal">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00).</div>
+  <div class="ayuda" id="vars_evento">En título, subtítulo, pie y texto puedes usar los datos del evento:
+    {evento}, {campeonato}, {dia} {fecha} y {hora} (del evento), {dias} (los que faltan), {faltan} («en 5 días», «mañana», «hoy»),
+    {inscritos}, {plazas}, {libres}, {precio}, {enlace} (inscripción), {web}, {horarios}, {resultados} y {ganadores} (para el pie del Cartel).</div>
 </div>
 
 <div class="fila">
@@ -1611,11 +2235,15 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 <script>
 // (no se puede llamar «modo»: dentro del formulario ese nombre es el de los botones de radio)
 function mostrarModo() {
-  const fecha = document.querySelector('input[name=modo][value=fecha]').checked;
-  document.getElementById('fecha').hidden = !fecha;
-  document.getElementById('semanal').hidden = fecha;
+  const m = document.querySelector('input[name=modo]:checked').value;
+  document.getElementById('fecha').hidden = m !== 'fecha';
+  document.getElementById('semanal').hidden = m !== 'semanal';
+  document.getElementById('evento').hidden = m !== 'evento';
+  document.getElementById('vars_normal').hidden = m === 'evento';
+  document.getElementById('vars_evento').hidden = m !== 'evento';
+  document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
 }
-document.querySelectorAll('input[name=modo]').forEach(r => r.addEventListener('change', mostrarModo));
+document.querySelectorAll('input[name=modo], select[name=momento]').forEach(r => r.addEventListener('change', mostrarModo));
 mostrarModo();
 </script>
 {% endblock %}"""
@@ -1732,6 +2360,15 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   </div>
 </div>
 <div class="caja">
+  <b>Racecore (para la pestaña Eventos)</b>
+  <div class="ayuda">El panel lee los eventos de Racecore por la red del circuito: solo lectura y sin datos personales.</div>
+  <label>Dirección del PC de Racecore</label>
+  <input type="text" name="racecore_url" value="{{ racecore_url }}" placeholder="Ej: 192.168.1.50  (puerto 8100 si no pones otro)">
+  <label>Token de lectura {% if racecore_token %}<span class="chip on">{{ racecore_token }}</span>{% endif %}</label>
+  <input type="password" name="racecore_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if racecore_token else 'El que genera Racecore en sus Ajustes' }}" autocomplete="off">
+  {% if racecore_token %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_racecore_token" value="1"> Quitar el token</label>{% endif %}
+</div>
+<div class="caja">
   <b>IA de OpenAI (opcional, de pago aparte)</b>
   <div class="ayuda">Sin clave, el panel usa tus fotos tal cual. Con clave aparece el campo «Prompt IA» en las publicaciones.</div>
   <label>Clave de la API {% if openai_key %}<span class="chip on">{{ openai_key }}</span>{% endif %}</label>
@@ -1754,14 +2391,126 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 </div>
 <button class="principal">Guardar ajustes</button>
 </form>
-<form method="post" action="{{ url_for('probar_telegram') }}" style="margin-top:10px"><button>Probar Telegram</button></form>
+<div class="fila" style="margin-top:10px">
+  <form class="enlinea" method="post" action="{{ url_for('probar_telegram') }}"><button>Probar Telegram</button></form>
+  <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><input type="hidden" name="volver" value="ajustes"><button>Probar Racecore</button></form>
+</div>
 
 <h2>Estado</h2>
 <div class="caja">
   <div>Programador: {% if ultima %}<span class="chip on">funcionando</span> última comprobación {{ ultima }}{% else %}<span class="chip">arrancando…</span>{% endif %}</div>
+  <div>Racecore: {% if not racecore.configurado %}<span class="chip">sin configurar</span>
+    {% elif racecore.error %}<span class="chip error">sin conexión</span> <span class="ayuda">{{ racecore.error }}</span>
+    {% elif racecore.ok %}<span class="chip on">conectado</span> última lectura {{ racecore.ok }} · {{ racecore.n }} evento(s)
+    {% else %}<span class="chip">pendiente</span>{% endif %}</div>
   <div>Fuentes propias: {% if fuentes %}<span class="chip on">{{ fuentes|join(', ') }}</span>{% else %}<span class="chip">las incluidas</span> <span class="ayuda">opcional: Titulo.ttf y Texto.ttf en la carpeta «fuentes»</span>{% endif %}</div>
   <div class="ayuda" style="margin-top:8px">Carpeta del panel: {{ carpeta }}</div>
 </div>
+{% endblock %}"""
+
+PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
+{% block contenido %}
+<div class="fila" style="justify-content:space-between"><h1>Eventos</h1>
+<div class="fila">
+  <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><button>Actualizar desde Racecore</button></form>
+  <a class="boton" href="{{ url_for('editar_evento') }}">+ Evento a mano</a>
+</div></div>
+<div class="caja">
+  <b>Racecore</b>
+  {% if not racecore.configurado %}<span class="chip">sin configurar</span>
+  <div class="ayuda">Pon la dirección y el token de Racecore en <a href="{{ url_for('ajustes') }}">Ajustes</a>. Mientras tanto puedes crear eventos a mano.</div>
+  {% elif racecore.error %}<span class="chip error">sin conexión</span>
+  <div class="aviso">{{ racecore.error }}{% if racecore.ok %} Se usan los datos leídos el {{ racecore.ok }}.{% endif %}</div>
+  {% elif racecore.ok %}<span class="chip on">conectado</span> <span class="ayuda">última lectura {{ racecore.ok }} · {{ racecore.n }} evento(s)</span>
+  {% else %}<span class="chip">leyendo…</span>{% endif %}
+  <div class="ayuda">El panel lee Racecore cada 10 minutos. Solo guarda lo necesario para las publicaciones: nombre, fecha, horarios, plazas, número de inscritos, precio, enlaces y el podio.</div>
+</div>
+
+{% if not hay_reglas %}
+<div class="caja">
+  <b>Aún no hay publicaciones para eventos</b>
+  <div class="ayuda">Son publicaciones normales con el modo «Eventos»: se preparan solas antes o después de cada evento, con sus datos.</div>
+  <div class="ayuda">Las de ejemplo: recordatorio cada 2 días (de 14 a 3 días antes), llamada a la acción (10 días antes), horarios (2 días antes), inscritos (1 día antes) y resultados (al día siguiente).</div>
+  <div class="fila" style="margin-top:10px">
+    <form class="enlinea" method="post" action="{{ url_for('crear_ejemplos') }}"><button class="principal">Crear las 5 de ejemplo (en pausa)</button></form>
+    <a class="boton" href="{{ url_for('editar_publicacion', modo='evento') }}">Crear una desde cero</a>
+  </div>
+</div>
+{% elif not hay_activas %}
+<div class="aviso">Ninguna publicación de eventos está activa. Actívalas en <a href="{{ url_for('publicaciones') }}">Publicaciones</a>.</div>
+{% endif %}
+
+{% for ev in eventos %}
+<div class="caja">
+  <div class="fila" style="justify-content:space-between; align-items:flex-start">
+    <div>
+      <b>{{ ev.nombre }}</b>
+      <span class="chip">{{ 'a mano' if ev.origen == 'manual' else 'Racecore' }}</span>
+      {% if ev.pasado %}<span class="chip">ya pasó</span>{% endif %}
+      {% if ev.cuando %}<div class="ayuda">{{ ev.cuando }}{% if ev.campeonato %} · {{ ev.campeonato }}{% endif %}</div>
+      {% else %}<div class="aviso">No entiendo la fecha «{{ ev.fecha_txt }}»: para este evento no se programa nada.</div>{% endif %}
+      <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
+    </div>
+    {% if ev.origen == 'manual' %}<div class="fila">
+      <a class="boton" href="{{ url_for('editar_evento', ev_id=ev.id) }}">Editar</a>
+      <form class="enlinea" method="post" action="{{ url_for('borrar_evento', ev_id=ev.id) }}" onsubmit="return confirm('¿Borrar el evento «{{ ev.nombre }}»?')"><button class="peligro">Borrar</button></form>
+    </div>{% endif %}
+  </div>
+  {% if ev.proximas %}
+  <div class="ayuda" style="margin-top:8px">Se preparará:</div>
+  <ul style="margin:4px 0 0; padding-left:20px">{% for cuando, nombre, nota in ev.proximas %}<li>{{ cuando }} · {{ nombre }}{% if nota %} <span class="ayuda">({{ nota }})</span>{% endif %}</li>{% endfor %}</ul>
+  {% endif %}
+  <details style="margin-top:8px"><summary class="ayuda" style="cursor:pointer">Ver datos</summary>
+    <div class="ayuda" style="white-space:pre-line; margin-top:6px">{% if ev.enlace %}Inscripción: {{ ev.enlace }}
+{% endif %}{% if ev.web %}Web: {{ ev.web }}
+{% endif %}{% if ev.horarios %}
+Horarios:
+{{ ev.horarios }}
+{% endif %}{% if ev.resultados %}
+Resultados:
+{{ ev.resultados }}
+{% endif %}</div>
+  </details>
+</div>
+{% else %}
+<div class="vacio">No hay eventos.<br>Conecta Racecore en Ajustes o crea uno con «+ Evento a mano».</div>
+{% endfor %}
+{% endblock %}"""
+
+PLANTILLAS["evento.html"] = """{% extends "base.html" %}
+{% block contenido %}
+<h1>{{ 'Editar evento' if ev.id else 'Nuevo evento a mano' }}</h1>
+<style>
+.dos { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
+@media (max-width:640px) { .dos { grid-template-columns:1fr; } }
+</style>
+<form method="post">
+<div class="caja">
+  <div class="dos">
+    <div><label>Nombre</label><input type="text" name="nombre" value="{{ ev.nombre }}" placeholder="Ej: Carrera de Navidad" required></div>
+    <div><label>Campeonato (opcional)</label><input type="text" name="campeonato" value="{{ ev.campeonato }}"></div>
+    <div><label>Fecha</label><input type="date" name="fecha" value="{{ ev.fecha }}" required></div>
+    <div><label>Hora de la primera tanda</label><input type="time" name="hora" value="{{ ev.hora }}"></div>
+    <div><label>Plazas</label><input type="number" name="plazas" min="0" value="{{ ev.plazas if ev.plazas is not none }}"></div>
+    <div><label>Inscritos</label><input type="number" name="inscritos" min="0" value="{{ ev.inscritos if ev.inscritos is not none }}"></div>
+    <div><label>Precio</label><input type="text" name="precio" value="{{ ev.precio }}" placeholder="Ej: 60 €"></div>
+    <div><label>&nbsp;</label><label style="color:var(--texto); margin:0"><input type="checkbox" name="abierta" value="1" {{ 'checked' if ev.abierta }}> Inscripción abierta</label></div>
+  </div>
+  <label>Enlace de inscripción</label><input type="text" name="enlace" value="{{ ev.enlace }}" placeholder="https://...">
+  <label>Web del evento</label><input type="text" name="web" value="{{ ev.web }}" placeholder="https://...">
+  <label>Horarios</label>
+  <textarea name="horarios" placeholder="09:00 · Entrenos&#10;10:30 · Clasificación&#10;12:00 · Final">{{ ev.horarios }}</textarea>
+  <label>Resultados</label>
+  <textarea name="resultados" placeholder="Final&#10;Senior: 1º Nombre · 2º Nombre · 3º Nombre">{{ ev.resultados }}</textarea>
+  <label>Ganadores (para el pie del Cartel)</label>
+  <input type="text" name="ganadores" value="{{ ev.ganadores }}" placeholder="Senior: Nombre | Junior: Nombre">
+  <div class="ayuda">Sin datos personales: solo lo que vaya a salir en redes.</div>
+</div>
+<div class="fila">
+  <button class="principal">Guardar</button>
+  <a class="boton" href="{{ url_for('eventos') }}">Cancelar</a>
+</div>
+</form>
 {% endblock %}"""
 
 app.jinja_loader = DictLoader(PLANTILLAS)

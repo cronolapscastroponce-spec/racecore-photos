@@ -38,6 +38,32 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Marcar como publicada.
 - **Ajustes**: la clave de OpenAI y Telegram (opcional). El estado del programador.
 
+## B2. Eventos (Racecore)
+
+El panel lee los eventos de Racecore por la red del circuito y prepara solas las publicaciones
+de cada evento: recordatorios, horarios, inscritos, resultados…
+
+1. En Racecore: genera el **token de lectura** (en sus Ajustes) y cópialo.
+2. En el panel, **Ajustes → Racecore**: pon la IP del PC de Racecore (ej. `192.168.1.50`;
+   el puerto 8100 se pone solo) y el token. Guarda: el panel prueba la conexión al momento.
+3. Pestaña **Eventos**: salen los eventos de Racecore. Se actualizan cada 10 minutos.
+   - Si Racecore no responde, se siguen usando los últimos datos y se avisa.
+   - También puedes crear **eventos a mano** (para lo que no esté en Racecore).
+4. Publicaciones para eventos: en **Eventos → Crear las 5 de ejemplo**. Se crean **en pausa**:
+   elige la categoría de fotos, prueba con «Generar ahora» y actívalas.
+   - Son publicaciones normales con el modo **Eventos**: antes, el mismo día o después del
+     evento; «de 14 a 3 días, cada 2» publica a 14, 12, 10, 8, 6 y 4 días.
+   - **Condición**: siempre, solo con la inscripción abierta, solo si quedan plazas o solo
+     cuando haya resultados (si aún no los hay, lo vuelve a mirar hasta la hora).
+   - **Solo los eventos que contengan**: para campañas de un campeonato concreto.
+   - Variables: `{evento}` `{campeonato}` `{dia}` `{fecha}` `{hora}` (del evento), `{dias}`,
+     `{faltan}` («en 5 días», «mañana»), `{inscritos}` `{plazas}` `{libres}` `{precio}`,
+     `{enlace}` (inscripción), `{web}`, `{horarios}`, `{resultados}` y `{ganadores}`.
+   - Resultados: pon poca antelación (el ejemplo usa 600 min) para que salgan con la carrera acabada.
+     «Otra foto» la rehace con los datos de ese momento.
+- Datos personales: el panel solo guarda nombre, fecha, horarios, plazas, **número** de inscritos,
+  precio, enlaces y el podio (lo que ya se publica en la web).
+
 ## C. Clave de OpenAI (para el Prompt IA)
 
 1. Entra en platform.openai.com → **Billing** y añade saldo. La suscripción de ChatGPT no sirve.
