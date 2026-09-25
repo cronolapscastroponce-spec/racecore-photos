@@ -676,11 +676,13 @@ def con_evento(pub, ev, occ):
     if ev["categoria_id"]:  # fotos elegidas para este evento (motos, alquiler...)
         datos["categoria_id"] = ev["categoria_id"]
     datos["_aviso"] = ""
+    if datos["diseno"] == "lista" and not datos["lista"].strip():
+        datos["_aviso"] = "La lista de nombres está vacía: en Eventos mira si llegan los nombres de Racecore. "
     if ev["origen"] == "racecore" and ev["actualizado"]:
         leido = datetime.strptime(ev["actualizado"], "%Y-%m-%d %H:%M:%S")
         if datetime.now() - leido > timedelta(hours=3):
-            datos["_aviso"] = (f"Ojo: datos de Racecore del {leido:%d/%m %H:%M} (no se han podido actualizar). "
-                               "Revisa los números antes de publicar.")
+            datos["_aviso"] += (f"Ojo: datos de Racecore del {leido:%d/%m %H:%M} (no se han podido actualizar). "
+                                "Revisa los números antes de publicar.")
     return datos
 
 
