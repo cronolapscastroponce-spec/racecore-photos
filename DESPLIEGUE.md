@@ -66,11 +66,14 @@ de cada evento: recordatorios, horarios, inscritos, resultados…
      alguna de las de ejemplo, en Eventos sale un botón para volver a crearla.
    - Variables: `{evento}` `{campeonato}` `{dia}` `{fecha}` `{hora}` (del evento), `{dias}`,
      `{faltan}` («en 5 días», «mañana»), `{inscritos}` `{plazas}` `{libres}` `{precio}`,
-     `{enlace}` (inscripción), `{web}`, `{horarios}`, `{resultados}` y `{ganadores}`.
+     `{enlace}` (inscripción), `{web}`, `{horarios}`, `{resultados}`, `{ganadores}` y `{pilotos}`.
+   - **Nombres de los inscritos**: `{pilotos}` (uno por línea, por categorías) y el diseño
+     **Cartel con lista**, que los pone en el centro de la imagen en columnas. En Ajustes eliges
+     «Ana Pérez» o «Ana P.».
    - Resultados: pon poca antelación (el ejemplo usa 600 min) para que salgan con la carrera acabada.
      «Otra foto» la rehace con los datos de ese momento.
-- Datos personales: el panel solo guarda nombre, fecha, horarios, plazas, **número** de inscritos,
-  precio, enlaces y el podio (lo que ya se publica en la web).
+- Datos personales: el panel solo guarda nombre, fecha, horarios, plazas, número de inscritos,
+  precio, enlaces, el podio y el **nombre para redes** de cada inscrito (nada más de ellos).
 
 ## C. Clave de OpenAI (para el Prompt IA)
 

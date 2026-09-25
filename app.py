@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     estilo_ia TEXT NOT NULL DEFAULT 'variado',
     momento TEXT NOT NULL DEFAULT 'antes', dias_desde INTEGER NOT NULL DEFAULT 14,
     dias_hasta INTEGER NOT NULL DEFAULT 3, cada INTEGER NOT NULL DEFAULT 2,
-    filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '');
+    filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '', lista TEXT NOT NULL DEFAULT '');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS eventos (
     plazas INTEGER, inscritos INTEGER, precio TEXT NOT NULL DEFAULT '', abierta INTEGER NOT NULL DEFAULT 0,
     enlace TEXT NOT NULL DEFAULT '', web TEXT NOT NULL DEFAULT '', horarios TEXT NOT NULL DEFAULT '',
     resultados TEXT NOT NULL DEFAULT '', ganadores TEXT NOT NULL DEFAULT '', actualizado TEXT NOT NULL DEFAULT '',
-    categoria_id INTEGER, UNIQUE (origen, ext_id));
+    categoria_id INTEGER, pilotos TEXT NOT NULL DEFAULT '', UNIQUE (origen, ext_id));
 """
 
 
@@ -170,10 +170,11 @@ def iniciar():
                                     "dias_hasta": "INTEGER NOT NULL DEFAULT 3",
                                     "cada": "INTEGER NOT NULL DEFAULT 2",
                                     "filtro": "TEXT NOT NULL DEFAULT ''",
-                                    "condicion": "TEXT NOT NULL DEFAULT ''"},
+                                    "condicion": "TEXT NOT NULL DEFAULT ''",
+                                    "lista": "TEXT NOT NULL DEFAULT ''"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0"},
-                  "eventos": {"categoria_id": "INTEGER"}}
+                  "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''"}}
         for tabla, cols in nuevas.items():
             existentes = {f["name"] for f in c.execute(f"PRAGMA table_info({tabla})")}
             for col, tipo in cols.items():
@@ -393,6 +394,41 @@ def texto_ganadores(resultados):
     return ""
 
 
+PARTICULAS = {"de", "del", "la", "las", "los", "y", "san", "da", "van", "von"}
+
+
+def nombre_para_redes(p, formato):
+    """{"nombre": "Ana", "apellidos": "de la Fuente Ruiz"} -> «Ana de la Fuente» (o «Ana F.»)."""
+    nombre, apellidos = txt(p.get("nombre")) or txt(p.get("piloto")), txt(p.get("apellidos")).split()
+    if not apellidos and " " in nombre and not txt(p.get("apellidos")):  # llegó el nombre entero
+        nombre, apellidos = nombre.split()[0], nombre.split()[1:]
+    primero = []
+    for palabra in apellidos:  # el primer apellido, con sus «de la...»
+        primero.append(palabra)
+        if palabra.lower() not in PARTICULAS:
+            break
+    if formato == "inicial" and primero:
+        return f"{nombre} {primero[-1][0].upper()}."
+    return " ".join([nombre] + primero).strip()
+
+
+def texto_pilotos(pilotos, formato):
+    """Inscritos para las publicaciones: uno por línea, por orden alfabético y, si hay varias
+    categorías, agrupados con su nombre delante («SENIOR:»)."""
+    grupos = {}
+    for p in pilotos:
+        nombre = nombre_para_redes(p, formato)
+        if nombre:
+            grupos.setdefault(txt(p.get("categoria")), []).append(nombre)
+    varias = len([c for c in grupos if c]) > 1
+    lineas = []
+    for cat in sorted(grupos, key=str.casefold):
+        if varias:
+            lineas.append(f"{(cat or 'Otros').upper()}:")
+        lineas += sorted(grupos[cat], key=str.casefold)
+    return "\n".join(lineas)
+
+
 def evento_de_racecore(e):
     """Del JSON de Racecore solo se guarda lo que hace falta para las publicaciones."""
     horarios = [h for h in (e.get("horarios") or []) if isinstance(h, dict)]
@@ -407,6 +443,9 @@ def evento_de_racecore(e):
         "enlace": txt(e.get("url_inscripcion")), "web": txt(e.get("url_portada")),
         "horarios": texto_horarios(horarios), "resultados": texto_resultados(resultados),
         "ganadores": texto_ganadores(resultados),
+        # solo el nombre para redes (nada más de cada piloto)
+        "pilotos": texto_pilotos([p for p in (e.get("pilotos") or []) if isinstance(p, dict)],
+                                 ajuste("nombres_formato", "completo")),
     }
 
 
@@ -620,6 +659,7 @@ def valores_evento(ev, occ):
         "{libres}": numero(plazas_libres(ev)), "{precio}": ev["precio"],
         "{enlace}": ev["enlace"] or ev["web"], "{web}": ev["web"] or ev["enlace"],
         "{horarios}": ev["horarios"], "{resultados}": ev["resultados"], "{ganadores}": ev["ganadores"],
+        "{pilotos}": ev["pilotos"],
     }
 
 
@@ -627,7 +667,9 @@ def con_evento(pub, ev, occ):
     """La publicación con los datos del evento ya puestos en sus textos."""
     valores = valores_evento(ev, occ)
     datos = dict(pub)
-    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia"):
+    if datos["diseno"] == "lista" and not datos["lista"].strip():
+        datos["lista"] = "{pilotos}"
+    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
         for clave, valor in valores.items():
             datos[campo] = (datos[campo] or "").replace(clave, valor or "")
     datos["nombre"] = f"{pub['nombre']} · {ev['nombre']}"
@@ -1085,6 +1127,47 @@ def bloque_redes(redes, W, escala):
     return lado, dibujar
 
 
+def pintar_lista(img, lineas, y0, y1, acento):
+    """Lista de nombres en columnas sobre un recuadro oscuro, centrada entre y0 e y1.
+    Las líneas que acaban en «:» (categorías) salen en amarillo."""
+    W = img.width
+    margen, pad = int(W * 0.05), int(W * 0.03)
+    alto = y1 - y0
+    if not lineas or alto < W * 0.12:
+        return
+    n = len(lineas)
+    largo = max(fuente_cartel("texto", 100).getlength(sin_marcas(l)) for l in lineas) / 100  # ancho a tamaño 1
+
+    def medidas(cols):
+        """(tamaño de letra, columnas, filas, ancho de columna) con ese número de columnas."""
+        filas = -(-n // cols)
+        ancho_col = (W - 2 * margen - 2 * pad - (cols - 1) * pad) / cols
+        return int(min(W * 0.055, (alto - 2 * pad) / filas / 1.3, ancho_col / largo)), cols, filas, ancho_col
+    # las columnas que dejan la letra más grande (con muchos nombres, 3 o 4; con pocos, 1)
+    tam, cols, filas, ancho_col = max(medidas(c) for c in (1, 2, 3, 4))
+    tam = max(14, tam)
+    f = fuente_cartel("texto", tam)
+
+    def cabe(linea):
+        while len(linea) > 1 and f.getlength(linea) > ancho_col:
+            linea = linea[:-2] + "…"
+        return linea
+    lh = int(tam * 1.3)
+    caja = filas * lh - (lh - alto_mayus(f)) + 2 * pad
+    arriba = y0 + max(0, (alto - caja) // 2)
+    capa = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(capa).rounded_rectangle([margen, arriba, W - margen, arriba + caja],
+                                           radius=int(W * 0.025), fill=(0, 0, 0, 170))
+    img.paste(capa, (0, 0), capa)
+    elementos = []
+    for i, linea in enumerate(lineas):
+        col, fila = divmod(i, filas)
+        x = margen + pad + col * (ancho_col + pad)
+        y = arriba + pad + fila * lh + alto_mayus(f)
+        elementos.append((x, y, cabe(sin_marcas(linea)), f, AMARILLO if linea.endswith(":") else BLANCO))
+    pintar(img, elementos, acento, sombra=max(2, int(W * 0.004)))
+
+
 def margenes(W, H):
     """(arriba, abajo) útiles: en stories se deja libre la zona que tapa Instagram."""
     story = H / W > 1.6
@@ -1116,6 +1199,10 @@ def superponer_cartel(img, pub, occ):
     titulo = variables(pub["titulo"], occ).upper()
     franja = variables(pub["subtitulo"], occ).upper()
     datos = variables(pub["pie"], occ).upper()
+    # «Cartel con lista»: los nombres van en el centro, así que se deja más hueco
+    lista = [l.strip() for l in variables(pub["lista"], occ).split("\n") if l.strip()] \
+        if pub["diseno"] == "lista" else []
+    minimo = H * (0.45 if lista else 0.1)
     redes = redes_configuradas()
     banner = banner_redes(W, H)
     if banner:  # el banner sustituye a las redes dibujadas y todo lo demás va encima
@@ -1134,7 +1221,7 @@ def superponer_cartel(img, pub, occ):
         hueco = int(W * 0.035 * escala)
         alto_arriba = sum(a for a, _ in de_arriba) + hueco * max(0, len(de_arriba) - 1)
         alto_abajo = sum(a for a, _ in de_abajo) + hueco * max(0, len(de_abajo) - 1)
-        if arriba + alto_arriba + H * 0.1 <= abajo - alto_abajo:
+        if arriba + alto_arriba + minimo <= abajo - alto_abajo:
             break
 
     inicio_abajo = abajo - alto_abajo - int(H * 0.15) if de_abajo else H
@@ -1149,6 +1236,8 @@ def superponer_cartel(img, pub, occ):
     for alto, dibujar in de_abajo:
         dibujar(img, y)
         y += alto + hueco
+    if lista:
+        pintar_lista(img, lista, arriba + alto_arriba + hueco, abajo - alto_abajo - hueco, acento)
     if banner:
         img.paste(banner[0], banner[1:], banner[0])
     return img
@@ -1285,7 +1374,7 @@ def con_version(pub, fila):
                  + ("" if fila["prueba"] else " AND prueba = 0"),
                  (pub["id"], fila["evento_id"], fila["id"]))[0]["n"]
     datos = dict(pub)
-    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia"):
+    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
         opciones = versiones(datos[campo])
         datos[campo] = opciones[n % len(opciones)]
     return datos
@@ -1492,7 +1581,8 @@ NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "
          "hora": "18:00", "antelacion": 1440, "categoria_id": None, "formato": "post",
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
          "diseno": "cartel", "estilo_ia": "variado",
-         "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": ""}
+         "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": "",
+         "lista": ""}
 
 
 @app.route("/publicaciones")
@@ -1565,7 +1655,8 @@ def leer_formulario():
         "texto": f.get("texto", "").strip(),
         "color": color,
         "prompt_ia": f.get("prompt_ia", "").strip(),
-        "diseno": f.get("diseno") if f.get("diseno") in ("sencillo", "ia") else "cartel",
+        "diseno": f.get("diseno") if f.get("diseno") in ("sencillo", "ia", "lista") else "cartel",
+        "lista": f.get("lista", "").strip().replace("\r", ""),
         "estilo_ia": f.get("estilo_ia") if f.get("estilo_ia") in ia_fondo.ESTILOS else "variado",
         "momento": f.get("momento") if f.get("momento") in MOMENTOS else "antes",
         "dias_desde": entero("dias_desde", 14, 0, 365),
@@ -1751,7 +1842,7 @@ def leer_eventos():
 
 EVENTO_NUEVO = {"id": None, "nombre": "", "campeonato": "", "fecha": "", "hora": "", "plazas": None,
                 "inscritos": None, "precio": "", "abierta": 1, "enlace": "", "web": "", "horarios": "",
-                "resultados": "", "ganadores": ""}
+                "resultados": "", "ganadores": "", "pilotos": ""}
 
 
 def evento_manual_o_404(ev_id):
@@ -1776,7 +1867,9 @@ def editar_evento(ev_id=None):
             "enlace": f.get("enlace", "").strip(), "web": f.get("web", "").strip(),
             "horarios": f.get("horarios", "").strip().replace("\r", ""),
             "resultados": f.get("resultados", "").strip().replace("\r", ""),
-            "ganadores": f.get("ganadores", "").strip(), "actualizado": ahora_txt(),
+            "ganadores": f.get("ganadores", "").strip(),
+            "pilotos": "\n".join(l.strip() for l in f.get("pilotos", "").splitlines() if l.strip()),
+            "actualizado": ahora_txt(),
         }
         if not leer_fecha(datos["fecha"]):
             flash("Pon la fecha del evento.", "error")
@@ -1823,11 +1916,11 @@ EJEMPLOS = [
      "titulo": "*HORARIOS*", "subtitulo": "{evento}\n{dia} {fecha}", "pie": "Empezamos a las {hora}",
      "texto": "⏱️ Horarios de {evento} ({dia} {fecha}):\n\n{horarios}\n\n¡Nos vemos en pista!"},
     {"nombre": "Evento · Inscritos", "momento": "antes", "dias_desde": 1, "dias_hasta": 1, "cada": 1,
-     "hora": "19:00", "condicion": "",
+     "hora": "19:00", "condicion": "", "diseno": "lista", "lista": "{pilotos}",
      "titulo": "*{inscritos}*\nPILOTOS", "subtitulo": "{evento}\n¡Es {faltan}!",
      "pie": "{dia} {fecha} | Desde las {hora}",
-     "texto": "✅ ¡Todo listo! {inscritos} pilotos para {evento}, {faltan}.\n\n"
-              "📋 Lista de inscritos y horarios: {web}"},
+     "texto": "✅ ¡Todo listo! {inscritos} pilotos para {evento}, {faltan}.\n\n{pilotos}\n\n"
+              "📋 Horarios y más información: {web}"},
     {"nombre": "Evento · Resultados", "momento": "despues", "dias_desde": 1, "dias_hasta": 1, "cada": 1,
      "hora": "10:00", "antelacion": 600, "condicion": "resultados",
      "titulo": "*RESULTADOS*", "subtitulo": "{evento}\n¡Enhorabuena!", "pie": "{ganadores}",
@@ -1967,8 +2060,9 @@ def borrar_categoria(cat_id):
 @app.route("/ajustes", methods=["GET", "POST"])
 def ajustes():
     if request.method == "POST":
-        antes = (ajuste("racecore_url"), ajuste("racecore_token"))
+        antes = (ajuste("racecore_url"), ajuste("racecore_token"), ajuste("nombres_formato", "completo"))
         guardar_ajuste("racecore_url", request.form.get("racecore_url", "").strip())
+        guardar_ajuste("nombres_formato", "inicial" if request.form.get("nombres_formato") == "inicial" else "completo")
         for clave in ("openai_key", "telegram_token", "racecore_token"):
             nuevo = request.form.get(clave, "").strip()
             if request.form.get(f"quitar_{clave}"):
@@ -1981,8 +2075,9 @@ def ajustes():
         calidad = request.form.get("openai_calidad", "medium")
         guardar_ajuste("openai_calidad", calidad if calidad in ("low", "medium", "high") else "medium")
         flash("Ajustes guardados.", "ok")
-        if ajuste("racecore_url") and (ajuste("racecore_url"), ajuste("racecore_token")) != antes:
-            leer_ahora()  # se prueba la conexión nueva enseguida
+        if ajuste("racecore_url") and (ajuste("racecore_url"), ajuste("racecore_token"),
+                                       ajuste("nombres_formato", "completo")) != antes:
+            leer_ahora()  # se prueba la conexión nueva enseguida (y se rehacen los nombres)
         return redirect(url_for("ajustes"))
 
     def oculta(clave):
@@ -1993,6 +2088,7 @@ def ajustes():
     return render_template(
         "ajustes.html", openai_key=oculta("openai_key"), telegram_token=oculta("telegram_token"),
         racecore_url=ajuste("racecore_url"), racecore_token=oculta("racecore_token"), racecore=estado_racecore(),
+        nombres_formato=ajuste("nombres_formato", "completo"),
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
         ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
         marcas_v={t: int(r.stat().st_mtime) if r.exists() else 0 for t, (r, _) in MARCAS.items()},
@@ -2303,11 +2399,17 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <div class="dos">
     <div><label>Diseño</label>
       <select name="diseno">
-        <option value="cartel" {{ 'selected' if pub.diseno not in ('sencillo', 'ia') }}>Cartel (título grande, franja de color, datos y redes)</option>
+        <option value="cartel" {{ 'selected' if pub.diseno not in ('sencillo', 'ia', 'lista') }}>Cartel (título grande, franja de color, datos y redes)</option>
+        <option value="lista" {{ 'selected' if pub.diseno == 'lista' }}>Cartel con lista (nombres en el centro)</option>
         <option value="sencillo" {{ 'selected' if pub.diseno == 'sencillo' }}>Sencillo (texto abajo)</option>
         {% if hay_ia or pub.diseno == 'ia' %}<option value="ia" {{ 'selected' if pub.diseno == 'ia' }}>IA completa (la IA pone los textos; logo y redes, el panel)</option>{% endif %}
       </select></div>
     <div><label>Color de acento</label><input type="color" name="color" value="{{ pub.color }}"></div>
+  </div>
+  <div id="caja_lista">
+    <label>Lista en el centro de la imagen</label>
+    <textarea name="lista" placeholder="{pilotos}">{{ pub.lista }}</textarea>
+    <div class="ayuda">Una línea por nombre. Con {pilotos} (o vacío, en publicaciones de eventos) salen los inscritos del evento. Las líneas que acaban en «:» salen en amarillo (categorías). Si son muchos, salen en 2, 3 o 4 columnas.</div>
   </div>
   <label>Título</label>
   <textarea name="titulo" rows="2" style="min-height:0" placeholder="Ej:&#10;{dia}&#10;DE *RECORD !!*">{{ pub.titulo }}</textarea>
@@ -2340,7 +2442,7 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <div class="ayuda"><b>Varias versiones:</b> escríbelas en la misma casilla separadas por una línea con <b>---</b> (tres guiones) y el panel las va turnando: la 1ª, luego la 2ª, la 3ª… Vale en Título, Franja y Texto del post, y van juntas: la 2ª versión del título sale con la 2ª del texto. «Generar ahora» pasa cada vez a la siguiente, para que las veas todas.</div>
   <div class="ayuda" id="vars_evento">En título, subtítulo, pie y texto puedes usar los datos del evento:
     {evento}, {campeonato}, {dia} {fecha} y {hora} (del evento), {dias} (los que faltan), {faltan} («en 5 días», «mañana», «hoy»),
-    {inscritos}, {plazas}, {libres}, {precio}, {enlace} (inscripción), {web}, {horarios}, {resultados} y {ganadores} (para el pie del Cartel).</div>
+    {inscritos}, {plazas}, {libres}, {precio}, {enlace} (inscripción), {web}, {horarios}, {resultados}, {ganadores} (para el pie del Cartel) y {pilotos} (nombres de los inscritos, uno por línea).</div>
 </div>
 
 <div class="fila">
@@ -2359,8 +2461,9 @@ function mostrarModo() {
   document.getElementById('vars_normal').hidden = m === 'evento';
   document.getElementById('vars_evento').hidden = m !== 'evento';
   document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
+  document.getElementById('caja_lista').hidden = document.querySelector('select[name=diseno]').value !== 'lista';
 }
-document.querySelectorAll('input[name=modo], select[name=momento]').forEach(r => r.addEventListener('change', mostrarModo));
+document.querySelectorAll('input[name=modo], select[name=momento], select[name=diseno]').forEach(r => r.addEventListener('change', mostrarModo));
 // A qué eventos de ahora se aplica (igual que eventos_de() en el servidor)
 const EVENTOS = {{ eventos_filtro|tojson }};
 function aplica() {
@@ -2499,6 +2602,11 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   <label>Token de lectura {% if racecore_token %}<span class="chip on">{{ racecore_token }}</span>{% endif %}</label>
   <input type="password" name="racecore_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if racecore_token else 'El que genera Racecore en sus Ajustes' }}" autocomplete="off">
   {% if racecore_token %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_racecore_token" value="1"> Quitar el token</label>{% endif %}
+  <label>Nombres de los pilotos en redes ({pilotos})</label>
+  <select name="nombres_formato">
+    <option value="completo" {{ 'selected' if nombres_formato != 'inicial' }}>Nombre y primer apellido (Ana Pérez)</option>
+    <option value="inicial" {{ 'selected' if nombres_formato == 'inicial' }}>Nombre e inicial del apellido (Ana P.)</option>
+  </select>
 </div>
 <div class="caja">
   <b>IA de OpenAI (opcional, de pago aparte)</b>
@@ -2645,6 +2753,8 @@ PLANTILLAS["evento.html"] = """{% extends "base.html" %}
   <label>Web del evento</label><input type="text" name="web" value="{{ ev.web }}" placeholder="https://...">
   <label>Horarios</label>
   <textarea name="horarios" placeholder="09:00 · Entrenos&#10;10:30 · Clasificación&#10;12:00 · Final">{{ ev.horarios }}</textarea>
+  <label>Inscritos (uno por línea, para {pilotos})</label>
+  <textarea name="pilotos" placeholder="Ana Pérez&#10;Luis Gómez">{{ ev.pilotos }}</textarea>
   <label>Resultados</label>
   <textarea name="resultados" placeholder="Final&#10;Senior: 1º Nombre · 2º Nombre · 3º Nombre">{{ ev.resultados }}</textarea>
   <label>Ganadores (para el pie del Cartel)</label>
