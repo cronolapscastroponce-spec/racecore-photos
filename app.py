@@ -1568,7 +1568,13 @@ def editar_publicacion(pub_id=None):
                 return generar_ahora(pub_id)
             flash("Guardada.", "ok")
             return redirect(url_for("publicaciones"))
+    eventos_filtro = consulta("SELECT nombre, campeonato FROM eventos ORDER BY fecha, nombre")
+    sugerencias = sorted({e["campeonato"] for e in eventos_filtro if e["campeonato"]}) + \
+        sorted({e["nombre"] for e in eventos_filtro if e["nombre"]} - {e["campeonato"] for e in eventos_filtro})
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
+                           sugerencias=sugerencias,
+                           eventos_filtro=[{"n": e["nombre"], "t": f"{e['nombre']} {e['campeonato']}"}
+                                           for e in eventos_filtro],
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
                            dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")),
                            estilos=ia_fondo.ESTILOS, momentos=MOMENTOS, condiciones=CONDICIONES)
@@ -2223,8 +2229,12 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
       </div>
       <div class="ayuda">Ej.: antes, de 14 a 3, cada 2 → se publica a 14, 12, 10, 8, 6 y 4 días del evento. Para un solo día pon el mismo número: de 10 a 10. Al día siguiente: después, de 1 a 1.</div>
     </div>
-    <label>Solo los eventos que contengan (opcional)</label>
-    <input type="text" name="filtro" value="{{ pub.filtro }}" placeholder="Ej: Resistencia. Vacío = todos los eventos">
+    <label>Solo para estos eventos (opcional)</label>
+    <input type="text" name="filtro" list="lista_eventos" value="{{ pub.filtro }}" autocomplete="off"
+           placeholder="Vacío = todos los eventos. Pulsa aquí para elegir un campeonato o un evento">
+    <datalist id="lista_eventos">{% for x in sugerencias %}<option value="{{ x }}">{% endfor %}</datalist>
+    <div class="ayuda">Si eliges un campeonato, vale para todas sus carreras, también las que se creen más adelante. También puedes escribir solo una parte del nombre.</div>
+    <div class="aviso" id="aplica" hidden></div>
   </div>
   <div class="dos">
     <div><label>Hora de publicación</label><input type="time" name="hora" value="{{ pub.hora }}" required></div>
@@ -2304,6 +2314,17 @@ function mostrarModo() {
   document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
 }
 document.querySelectorAll('input[name=modo], select[name=momento]').forEach(r => r.addEventListener('change', mostrarModo));
+// A qué eventos de ahora se aplica el filtro (igual que en el servidor: el texto está en el nombre o el campeonato)
+const EVENTOS = {{ eventos_filtro|tojson }};
+function aplica() {
+  const f = document.querySelector('input[name=filtro]').value.trim().toLowerCase();
+  const caja = document.getElementById('aplica');
+  const si = EVENTOS.filter(e => e.t.toLowerCase().includes(f)).map(e => e.n);
+  caja.hidden = !f || !EVENTOS.length;
+  caja.textContent = si.length ? 'Ahora se aplica a: ' + si.join(', ') : 'Ahora no coincide con ningún evento.';
+}
+document.querySelector('input[name=filtro]').addEventListener('input', aplica);
+aplica();
 mostrarModo();
 </script>
 {% endblock %}"""
