@@ -24,6 +24,8 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Diseño **Cartel**: título grande (lo que va entre `*asteriscos*` sale en color), franja
     de color (la última línea sale más grande), datos separados con `|` y tus redes abajo.
   - Diseño **Sencillo**: texto abajo con una etiqueta de color.
+  - Diseño **IA completa** (con clave de OpenAI): la IA hace el cartel con tus textos a partir de
+    la foto; el panel pone siempre encima el logo y las redes. Si la IA falla, sale el Cartel.
   - Variables: `{dia}` (sábado), `{fecha}` (27 de septiembre) y `{hora}` (18:00).
   - **Prompt IA**: si lo dejas vacío, se usa la foto tal cual. Si escribes algo, la IA
     rehace solo el fondo; el texto lo pone siempre el panel.

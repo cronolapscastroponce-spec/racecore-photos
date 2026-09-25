@@ -441,10 +441,10 @@ def pintar(img, elementos, color_marca, sombra=0, opacidad=150):
             x += fnt.getlength(t)
 
 
-def oscurecer_cartel(img, fin_arriba, inicio_abajo):
+def oscurecer_cartel(img, fin_arriba, inicio_abajo, vineta=True):
     """Viñeta + oscurecido arriba (título) y abajo (franja, datos, redes)."""
     W, H = img.size
-    mascara = Image.radial_gradient("L").resize((W, H)).point(lambda v: int(v * 0.5))
+    mascara = Image.radial_gradient("L").resize((W, H)).point(lambda v: int(v * 0.5) if vineta else 0)
     if fin_arriba > 0:
         arriba = Image.linear_gradient("L").rotate(180).resize((W, fin_arriba))
         capa = Image.new("L", (W, H), 0)
@@ -513,12 +513,19 @@ def icono_red(tipo, lado):
     return m.resize((lado, lado), Image.LANCZOS)
 
 
-def bloque_logo(W, H, escala):
+def logo_ajustado(W, H, escala):
     if not LOGO.exists():
         return None
     with Image.open(LOGO) as lg:
         lg = lg.convert("RGBA")
     lg.thumbnail((int(W * 0.46 * escala), int(min(W * 0.2, H * 0.13) * escala)), Image.LANCZOS)
+    return lg
+
+
+def bloque_logo(W, H, escala):
+    lg = logo_ajustado(W, H, escala)
+    if lg is None:
+        return None
     margen = int(W * 0.05)
 
     def dibujar(img, y):
@@ -660,16 +667,24 @@ def bloque_redes(redes, W, escala):
     return lado, dibujar
 
 
+def margenes(W, H):
+    """(arriba, abajo) útiles: en stories se deja libre la zona que tapa Instagram."""
+    story = H / W > 1.6
+    return (int(H * 0.09) if story else int(W * 0.045)), H - (int(H * 0.12) if story else int(W * 0.04))
+
+
+def redes_configuradas():
+    return [(t, ajuste(f"red_{t}")) for t in REDES if ajuste(f"red_{t}")]
+
+
 def superponer_cartel(img, pub, occ):
     W, H = img.size
-    story = H / W > 1.6
-    arriba = int(H * 0.09) if story else int(W * 0.045)
-    abajo = H - (int(H * 0.12) if story else int(W * 0.04))
+    arriba, abajo = margenes(W, H)
     acento = color_rgb(pub["color"])
     titulo = variables(pub["titulo"], occ).upper()
     franja = variables(pub["subtitulo"], occ).upper()
     datos = variables(pub["pie"], occ).upper()
-    redes = [(t, ajuste(f"red_{t}")) for t in REDES if ajuste(f"red_{t}")]
+    redes = redes_configuradas()
 
     # Foto con más garra: algo más de contraste y color
     img = ImageEnhance.Contrast(ImageEnhance.Color(img).enhance(1.15)).enhance(1.08)
@@ -699,10 +714,38 @@ def superponer_cartel(img, pub, occ):
     return img
 
 
+def superponer_marca(img):
+    """Diseño «IA completa»: los textos ya los puso la IA; aquí solo logo y redes, siempre iguales."""
+    W, H = img.size
+    arriba, abajo = margenes(W, H)
+    redes = bloque_redes(redes_configuradas(), W, 1.0)
+    if redes:
+        alto, dibujar = redes
+        oscurecer_cartel(img, 0, abajo - alto - int(H * 0.06), vineta=False)
+        dibujar(img, abajo - alto)
+    logo = bloque_logo(W, H, 1.0)
+    if logo:
+        logo[1](img, arriba)
+    return img
+
+
+def prompt_ia_cartel(pub, occ, W, H):
+    """Prompt para «IA completa», con los huecos exactos que luego ocupan el logo y las redes."""
+    arriba, abajo = margenes(W, H)
+    lg = logo_ajustado(W, H, 1.0)
+    redes = bloque_redes(redes_configuradas(), W, 1.0)
+    zona_logo = (round((W * 0.05 + lg.width) / W * 100) + 4, round((arriba + lg.height) / H * 100) + 3) if lg else None
+    zona_redes = round((H - abajo + redes[0]) / H * 100) + 3 if redes else None
+    lineas = lambda texto: [l.strip() for l in variables(texto, occ).upper().split("\n") if l.strip()]  # noqa: E731
+    datos = [x.strip() for x in variables(pub["pie"], occ).upper().split("|") if x.strip()]
+    return ia_fondo.prompt_cartel(lineas(pub["titulo"]), lineas(pub["subtitulo"]), datos, pub["color"],
+                                  pub["prompt_ia"], zona_logo, zona_redes)
+
+
 def superponer(img, pub, occ):
     if pub["diseno"] == "sencillo":
         return superponer_sencillo(img, pub, occ)
-    return superponer_cartel(img, pub, occ)
+    return superponer_cartel(img, pub, occ)  # también si «IA completa» no ha podido usarse
 
 
 def elegir_foto(pub_id, fotos, evitar=None):
@@ -730,7 +773,22 @@ def componer(pub, occ, evitar=None):
     else:
         ruta = DIR_FOTOS / foto["archivo"]
         clave = ajuste("openai_key")
-        if pub["prompt_ia"].strip() and clave:  # sin clave de OpenAI la IA simplemente no se usa
+        if pub["diseno"] == "ia":
+            if not clave:
+                avisos.append("«IA completa» necesita la clave de OpenAI (Ajustes). Se ha usado el diseño Cartel.")
+            else:
+                try:
+                    with DIBUJO:
+                        prompt = prompt_ia_cartel(pub, occ, ancho, alto)
+                    img = ia_fondo.generar_cartel(ruta, prompt, ancho, alto, clave,
+                                                  calidad=ajuste("openai_calidad", "medium"))
+                    with DIBUJO:
+                        img = superponer_marca(img)
+                    return img, foto["id"], True, ""
+                except Exception as e:  # la IA nunca debe dejar la publicación sin imagen
+                    log.warning("IA: %s", e)
+                    avisos.append(f"IA: ha fallado ({str(e)[:300]}). Se ha usado el diseño Cartel.")
+        elif pub["prompt_ia"].strip() and clave:  # sin clave de OpenAI la IA simplemente no se usa
             if True:
                 try:
                     fondo = ia_fondo.generar_fondo(ruta, pub["prompt_ia"], ancho, alto, clave,
@@ -974,7 +1032,7 @@ def leer_formulario():
         "texto": f.get("texto", "").strip(),
         "color": color,
         "prompt_ia": f.get("prompt_ia", "").strip(),
-        "diseno": "sencillo" if f.get("diseno") == "sencillo" else "cartel",
+        "diseno": f.get("diseno") if f.get("diseno") in ("sencillo", "ia") else "cartel",
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
@@ -1428,6 +1486,7 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
       <select name="diseno">
         <option value="cartel" {{ 'selected' if pub.diseno != 'sencillo' }}>Cartel (título grande, franja de color, datos y redes)</option>
         <option value="sencillo" {{ 'selected' if pub.diseno == 'sencillo' }}>Sencillo (texto abajo)</option>
+        {% if hay_ia or pub.diseno == 'ia' %}<option value="ia" {{ 'selected' if pub.diseno == 'ia' }}>IA completa (la IA pone los textos; logo y redes, el panel)</option>{% endif %}
       </select></div>
     <div><label>Color de acento</label><input type="color" name="color" value="{{ pub.color }}"></div>
   </div>
@@ -1442,8 +1501,9 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <div class="ayuda">En «Cartel», separa cada dato con | (salen con una barra amarilla). En «Sencillo» es la etiqueta de color.</div>
   {% if hay_ia %}
   <label>Prompt IA (opcional)</label>
-  <textarea name="prompt_ia" placeholder="Vacío = la foto tal cual. Ej: atardecer dorado, luz cálida, ambiente de competición">{{ pub.prompt_ia }}</textarea>
-  <div class="ayuda">La IA solo cambia el fondo a partir de una de tus fotos. El texto lo pone siempre el panel.</div>
+  <textarea name="prompt_ia" placeholder="Ej: atardecer dorado, luz cálida, ambiente de competición">{{ pub.prompt_ia }}</textarea>
+  <div class="ayuda">Con «Cartel» o «Sencillo», si lo rellenas la IA rehace solo el fondo y el texto lo pone el panel.</div>
+  <div class="ayuda">Con «IA completa», la IA hace el cartel con tus textos y aquí describes el ambiente. Revisa los textos antes de publicar (si hay una errata, «Otra foto») y pon calidad Alta en Ajustes.</div>
   {% else %}<input type="hidden" name="prompt_ia" value="{{ pub.prompt_ia }}">{% endif %}
   <div class="ayuda">En la imagen no uses emojis (salen como cuadrados). En el texto del post sí.</div>
 </div>
