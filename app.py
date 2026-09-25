@@ -80,13 +80,15 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     categoria_id INTEGER, formato TEXT NOT NULL DEFAULT 'post',
     titulo TEXT NOT NULL DEFAULT '', subtitulo TEXT NOT NULL DEFAULT '', pie TEXT NOT NULL DEFAULT '',
     texto TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '#e10600',
-    prompt_ia TEXT NOT NULL DEFAULT '', diseno TEXT NOT NULL DEFAULT 'cartel');
+    prompt_ia TEXT NOT NULL DEFAULT '', diseno TEXT NOT NULL DEFAULT 'cartel',
+    estilo_ia TEXT NOT NULL DEFAULT 'variado');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
     prueba INTEGER NOT NULL DEFAULT 0, estado TEXT NOT NULL DEFAULT 'generando',
     archivo TEXT, texto TEXT NOT NULL DEFAULT '', foto_id INTEGER,
-    con_ia INTEGER NOT NULL DEFAULT 0, aviso TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL);
+    con_ia INTEGER NOT NULL DEFAULT 0, aviso TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL,
+    estilo TEXT NOT NULL DEFAULT '');
 -- una sola imagen programada por publicación y hora (las pruebas no cuentan)
 CREATE UNIQUE INDEX IF NOT EXISTS generadas_unica ON generadas(publicacion_id, ocurrencia) WHERE prueba = 0;
 CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
@@ -140,9 +142,14 @@ def iniciar():
     try:
         c.executescript(ESQUEMA)
         # Columnas añadidas en versiones posteriores
-        columnas = {f["name"] for f in c.execute("PRAGMA table_info(publicaciones)")}
-        if "diseno" not in columnas:
-            c.execute("ALTER TABLE publicaciones ADD COLUMN diseno TEXT NOT NULL DEFAULT 'cartel'")
+        nuevas = {"publicaciones": {"diseno": "TEXT NOT NULL DEFAULT 'cartel'",
+                                    "estilo_ia": "TEXT NOT NULL DEFAULT 'variado'"},
+                  "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''"}}
+        for tabla, cols in nuevas.items():
+            existentes = {f["name"] for f in c.execute(f"PRAGMA table_info({tabla})")}
+            for col, tipo in cols.items():
+                if col not in existentes:
+                    c.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
         c.execute("PRAGMA journal_mode=WAL")
         # Lo que se quedó a medias por un reinicio
         c.execute("UPDATE generadas SET estado = 'error', aviso = 'Interrumpido: se reinició el panel' "
@@ -758,7 +765,18 @@ def superponer_marca(img):
     return img
 
 
-def prompt_ia_cartel(pub, occ, W, H):
+def elegir_estilo(pub, evitar=None):
+    """Estilo fijo de la publicación, o con «Variado» uno al azar distinto del último."""
+    if pub["estilo_ia"] in ia_fondo.ESTILOS:
+        return pub["estilo_ia"]
+    if evitar is None:
+        ultimo = consulta("SELECT estilo FROM generadas WHERE publicacion_id = ? AND estilo != '' "
+                          "ORDER BY id DESC LIMIT 1", (pub["id"],))
+        evitar = ultimo[0]["estilo"] if ultimo else None
+    return random.choice([e for e in ia_fondo.ESTILOS if e != evitar])
+
+
+def prompt_ia_cartel(pub, occ, W, H, estilo="marca"):
     """Prompt para «IA completa», con los huecos exactos que luego ocupan el logo y las redes."""
     arriba, abajo = margenes(W, H)
     lg = logo_ajustado(W, H, 1.0)
@@ -772,7 +790,7 @@ def prompt_ia_cartel(pub, occ, W, H):
     lineas = lambda texto: [l.strip() for l in variables(texto, occ).upper().split("\n") if l.strip()]  # noqa: E731
     datos = [x.strip() for x in variables(pub["pie"], occ).upper().split("|") if x.strip()]
     return ia_fondo.prompt_cartel(lineas(pub["titulo"]), lineas(pub["subtitulo"]), datos, pub["color"],
-                                  pub["prompt_ia"], zona_logo, zona_redes)
+                                  pub["prompt_ia"], zona_logo, zona_redes, estilo)
 
 
 def superponer(img, pub, occ):
@@ -792,7 +810,8 @@ def elegir_foto(pub_id, fotos, evitar=None):
     return random.choice([f for f in fotos if f["id"] != evitar] or fotos)
 
 
-def componer(pub, occ, evitar=None):
+def componer(pub, occ, evitar=None, evitar_estilo=None):
+    """(imagen, foto_id, con_ia, aviso, estilo)"""
     _, ancho, alto = FORMATOS.get(pub["formato"], FORMATOS["post"])
     avisos = []
     fotos = consulta("SELECT * FROM fotos WHERE categoria_id = ?", (pub["categoria_id"],))
@@ -811,13 +830,14 @@ def componer(pub, occ, evitar=None):
                 avisos.append("«IA completa» necesita la clave de OpenAI (Ajustes). Se ha usado el diseño Cartel.")
             else:
                 try:
+                    estilo = elegir_estilo(pub, evitar_estilo)
                     with DIBUJO:
-                        prompt = prompt_ia_cartel(pub, occ, ancho, alto)
+                        prompt = prompt_ia_cartel(pub, occ, ancho, alto, estilo)
                     img = ia_fondo.generar_cartel(ruta, prompt, ancho, alto, clave,
                                                   calidad=ajuste("openai_calidad", "medium"))
                     with DIBUJO:
                         img = superponer_marca(img)
-                    return img, foto["id"], True, ""
+                    return img, foto["id"], True, "", estilo
                 except Exception as e:  # la IA nunca debe dejar la publicación sin imagen
                     log.warning("IA: %s", e)
                     avisos.append(f"IA: ha fallado ({str(e)[:300]}). Se ha usado el diseño Cartel.")
@@ -836,7 +856,7 @@ def componer(pub, occ, evitar=None):
 
     with DIBUJO:
         img = superponer(fondo, pub, occ)
-    return img, (foto["id"] if foto else None), con_ia, " ".join(avisos)
+    return img, (foto["id"] if foto else None), con_ia, " ".join(avisos), ""
 
 
 # ---------------------------------------------------------------- generación y programador
@@ -850,14 +870,15 @@ def reclamar(pub_id, occ, prueba):
 
 def generar(gen_id, pub, occ, enviar=False):
     try:
-        anterior = consulta("SELECT archivo, foto_id FROM generadas WHERE id = ?", (gen_id,))
-        img, foto_id, con_ia, aviso = componer(pub, occ, anterior[0]["foto_id"] if anterior else None)
+        anterior = consulta("SELECT archivo, foto_id, estilo FROM generadas WHERE id = ?", (gen_id,))
+        img, foto_id, con_ia, aviso, estilo = componer(pub, occ, anterior[0]["foto_id"] if anterior else None,
+                                                      (anterior[0]["estilo"] or None) if anterior else None)
         archivo = f"{pub['id']}_{occ:%Y%m%d_%H%M}_{gen_id}_{uuid.uuid4().hex[:6]}.jpg"
         img.save(DIR_GEN / archivo, "JPEG", quality=92, optimize=True)
         texto = variables(pub["texto"], occ)
         cur = ejecutar("UPDATE generadas SET estado = 'lista', archivo = ?, texto = ?, foto_id = ?, con_ia = ?, "
-                       "aviso = ? WHERE id = ? AND estado = 'generando'",
-                       (archivo, texto, foto_id, int(con_ia), aviso, gen_id))
+                       "aviso = ?, estilo = ? WHERE id = ? AND estado = 'generando'",
+                       (archivo, texto, foto_id, int(con_ia), aviso, estilo, gen_id))
         if not cur.rowcount:  # la borraron mientras se generaba
             (DIR_GEN / archivo).unlink(missing_ok=True)
             return
@@ -960,7 +981,8 @@ def listas():
 
     def preparar(g):
         occ = datetime.strptime(g["ocurrencia"], "%Y-%m-%d %H:%M")
-        return dict(g) | {"cuando": cuando_txt(occ), "nombre": g["nombre"] or "(publicación borrada)"}
+        return dict(g) | {"cuando": cuando_txt(occ), "nombre": g["nombre"] or "(publicación borrada)",
+                          "estilo_nombre": ia_fondo.ESTILOS.get(g["estilo"], ("",))[0]}
 
     return render_template("listas.html", filas=[preparar(g) for g in filas],
                            hechas=[preparar(g) for g in hechas],
@@ -1008,7 +1030,7 @@ def borrar_generada(gen_id):
 NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "fecha": "",
          "hora": "18:00", "antelacion": 1440, "categoria_id": None, "formato": "post",
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
-         "diseno": "cartel"}
+         "diseno": "cartel", "estilo_ia": "variado"}
 
 
 @app.route("/publicaciones")
@@ -1066,6 +1088,7 @@ def leer_formulario():
         "color": color,
         "prompt_ia": f.get("prompt_ia", "").strip(),
         "diseno": f.get("diseno") if f.get("diseno") in ("sencillo", "ia") else "cartel",
+        "estilo_ia": f.get("estilo_ia") if f.get("estilo_ia") in ia_fondo.ESTILOS else "variado",
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
@@ -1102,7 +1125,8 @@ def editar_publicacion(pub_id=None):
             return redirect(url_for("publicaciones"))
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
-                           dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")))
+                           dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")),
+                           estilos=ia_fondo.ESTILOS)
 
 
 @app.post("/publicaciones/<int:pub_id>/generar")
@@ -1415,7 +1439,7 @@ PLANTILLAS["listas.html"] = """{% extends "base.html" %}
   <div>
     <b>{{ g.nombre }}</b>
     {% if g.prueba %}<span class="chip prueba">Prueba</span>{% endif %}
-    {% if g.con_ia %}<span class="chip ia">IA</span>{% endif %}
+    {% if g.con_ia %}<span class="chip ia">IA{{ ' · ' ~ g.estilo_nombre if g.estilo_nombre }}</span>{% endif %}
     <div class="ayuda">Publicar: {{ g.cuando }}</div>
     {% if g.aviso %}<div class="aviso">{{ g.aviso }}</div>{% endif %}
     {% if g.estado == 'lista' %}
@@ -1542,7 +1566,7 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <div class="dos">
     <div><label>Diseño</label>
       <select name="diseno">
-        <option value="cartel" {{ 'selected' if pub.diseno != 'sencillo' }}>Cartel (título grande, franja de color, datos y redes)</option>
+        <option value="cartel" {{ 'selected' if pub.diseno not in ('sencillo', 'ia') }}>Cartel (título grande, franja de color, datos y redes)</option>
         <option value="sencillo" {{ 'selected' if pub.diseno == 'sencillo' }}>Sencillo (texto abajo)</option>
         {% if hay_ia or pub.diseno == 'ia' %}<option value="ia" {{ 'selected' if pub.diseno == 'ia' }}>IA completa (la IA pone los textos; logo y redes, el panel)</option>{% endif %}
       </select></div>
@@ -1558,11 +1582,17 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <input type="text" name="pie" value="{{ pub.pie }}" placeholder="Ej: Grupo mínimo 6 corredores | Reserva necesaria">
   <div class="ayuda">En «Cartel», separa cada dato con | (salen con una barra amarilla). En «Sencillo» es la etiqueta de color.</div>
   {% if hay_ia %}
+  <label>Estilo (solo con «IA completa»)</label>
+  <select name="estilo_ia">
+    <option value="variado" {{ 'selected' if pub.estilo_ia not in estilos }}>Variado: cambia cada vez</option>
+    {% for clave, e in estilos.items() %}<option value="{{ clave }}" {{ 'selected' if pub.estilo_ia == clave }}>Siempre {{ e[0] }}</option>{% endfor %}
+  </select>
   <label>Prompt IA (opcional)</label>
   <textarea name="prompt_ia" placeholder="Ej: atardecer dorado, luz cálida, ambiente de competición">{{ pub.prompt_ia }}</textarea>
   <div class="ayuda">Con «Cartel» o «Sencillo», si lo rellenas la IA rehace solo el fondo y el texto lo pone el panel.</div>
-  <div class="ayuda">Con «IA completa», la IA hace el cartel con tus textos y aquí describes el ambiente. Revisa los textos antes de publicar (si hay una errata, «Otra foto») y pon calidad Alta en Ajustes.</div>
-  {% else %}<input type="hidden" name="prompt_ia" value="{{ pub.prompt_ia }}">{% endif %}
+  <div class="ayuda">Con «IA completa», la IA hace el cartel con tus textos y aquí puedes añadir ambiente o detalles. «Otra foto» cambia también de estilo. Revisa los textos antes de publicar y pon calidad Alta en Ajustes.</div>
+  {% else %}<input type="hidden" name="prompt_ia" value="{{ pub.prompt_ia }}">
+  <input type="hidden" name="estilo_ia" value="{{ pub.estilo_ia }}">{% endif %}
   <div class="ayuda">En la imagen no uses emojis (salen como cuadrados). En el texto del post sí.</div>
 </div>
 

@@ -27,6 +27,36 @@ Reglas obligatorias:
 """.strip()
 
 
+# Estilos para «IA completa». Con «Variado» se elige uno distinto cada vez.
+ESTILOS = {
+    "marca": ("Marca", "cartel de competición moderno como el de la marca: tipografía sans serif muy gruesa, en "
+              "cursiva y en MAYÚSCULAS, blanca con sombra suave; las palabras destacadas en el color principal; una "
+              "raya fina inclinada del color principal bajo el título; el mensaje destacado dentro de una franja "
+              "inclinada del color principal, como un brochazo de pintura con los bordes rasgados; cada dato con una "
+              "barra vertical amarilla delante. Foto con mucho contraste y colores vivos."),
+    "neon": ("Neón nocturno", "ambiente nocturno con luces de neón y reflejos en el asfalto; los textos brillan como "
+             "tubos de neón (en blanco y en el color principal) con resplandor; estética cyberpunk moderna, tonos "
+             "oscuros con acentos de color intensos."),
+    "retro": ("Retro años 80", "estética synthwave de los años 80: cielo en degradado morado y naranja, sol retro, "
+              "rejilla en perspectiva, tipografía cromada y brillante con contorno; colores saturados."),
+    "revista": ("Portada de revista", "portada de revista de motor: el título enorme queda en parte DETRÁS del piloto "
+                "y del kart (efecto de profundidad), textos elegantes en blanco, composición limpia de fotografía "
+                "profesional."),
+    "velocidad": ("Velocidad", "sensación de velocidad extrema: desenfoque de movimiento en el fondo, líneas de "
+                  "velocidad y estelas de luz del color principal; tipografía muy inclinada y dinámica."),
+    "tv": ("Gráficos de TV", "gráficos de retransmisión de carreras tipo Fórmula 1: paneles geométricos "
+           "semitransparentes, cortes en diagonal, tipografía técnica condensada, aspecto oficial y moderno."),
+    "grunge": ("Urbano grunge", "estilo urbano y callejero: texturas de pintura y spray, salpicaduras, cinta "
+               "adhesiva, tipografía estarcida o hecha a brocha; contraste alto y aspecto rebelde."),
+    "vintage": ("Cartel vintage", "cartel de carreras de los años 60-70: aspecto de litografía, colores algo "
+                "apagados, textura de papel viejo, tipografía clásica de rótulo antiguo."),
+    "comic": ("Cómic", "estilo cómic y pop art: contornos negros marcados, tramas de puntos, colores planos muy vivos, "
+              "tipografía de cómic gruesa."),
+    "minimal": ("Minimalista", "diseño minimalista y elegante: mucho espacio limpio, tipografía sans serif grande y "
+                "fina, muy pocos elementos, aspecto premium."),
+}
+
+
 def nombre_color(hexa):
     """«#e8195a» -> «#e8195a (rosa fucsia)»: a la IA le ayuda tener el nombre además del código."""
     try:
@@ -47,37 +77,35 @@ def _comillas(texto):
     return "«" + texto.replace("*", "") + "»"
 
 
-def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes):
+def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes, estilo="marca"):
     """Instrucciones para que la IA haga el cartel con los textos exactos.
 
     titulo y franja: listas de líneas (lo que va entre *asteriscos* en color);
     datos: lista de textos cortos; zona_logo: (ancho %, alto %) libre arriba a la
-    izquierda o None; zona_redes: alto % libre abajo o None.
+    izquierda o None; zona_redes: alto % libre abajo o None; estilo: clave de ESTILOS.
     """
     p = [
-        "Convierte la foto adjunta en un cartel publicitario para redes sociales de un circuito de karting.",
-        "Mantén el mismo circuito, kart y piloto de la foto: tiene que seguir pareciendo una foto real, con mucho "
-        "contraste, colores vivos, fondo algo desenfocado y el protagonista en el centro.",
-        "Estilo: cartel de competición moderno. Tipografía sans serif muy gruesa, en cursiva y en MAYÚSCULAS, "
-        "blanca con una sombra suave.",
-        f"Color principal: {nombre_color(color)}. Detalles en amarillo.",
+        "Convierte la foto adjunta en un cartel publicitario para redes sociales de un circuito de karting, "
+        "con acabado profesional.",
+        "Mantén el mismo circuito, kart y piloto de la foto (que se reconozcan), con el protagonista en el centro; "
+        "la luz, el ambiente y el tratamiento de la imagen pueden cambiar según el estilo.",
+        f"ESTILO: {ESTILOS.get(estilo, ESTILOS['marca'])[1]}",
+        f"Color principal de la marca: {nombre_color(color)}. Úsalo en los elementos destacados.",
         "",
         "TEXTOS: escribe EXACTAMENTE estos textos, letra por letra, con sus tildes y signos. "
         "No añadas ni cambies ninguna palabra, número o precio, y no pongas ningún otro texto:",
     ]
     if titulo:
-        p.append("- Título enorme en la parte de arriba, una línea por renglón:")
+        p.append("- Título principal, grande y protagonista, una línea por renglón:")
         for linea in titulo:
             marcado = [t for i, t in enumerate(linea.split("*")) if i % 2 == 1 and t.strip()]
-            nota = f" (en color principal: {', '.join(_comillas(m) for m in marcado)})" if marcado else ""
+            nota = f" (resalta en el color principal: {', '.join(_comillas(m) for m in marcado)})" if marcado else ""
             p.append(f"    {_comillas(linea)}{nota}")
-        p.append("  Debajo del título, una raya fina inclinada del color principal.")
     if franja:
-        p.append("- En la parte de abajo, una franja ancha e inclinada del color principal, como un brochazo de "
-                 "pintura con los bordes rasgados, y dentro en blanco (la última línea más grande):")
+        p.append("- Mensaje destacado, muy visible, en la parte de abajo (la última línea más grande):")
         p += [f"    {_comillas(l)}" for l in franja]
     if datos:
-        p.append("- Debajo de la franja, en letra más pequeña, cada dato con una barra vertical amarilla delante:")
+        p.append("- Datos, en letra más pequeña, cerca del mensaje destacado:")
         p += [f"    {_comillas(d)}" for d in datos]
     p.append("")
     if zona_logo:
