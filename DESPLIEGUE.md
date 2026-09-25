@@ -10,9 +10,8 @@ abrir puertos y arrancando solo con el PC.
 2. Doble clic en **`1_instalar.bat`**. Instala Python si hace falta y las librerías.
 3. Doble clic en **`2_probar.bat`**. Se abre el panel en el navegador
    (`http://localhost:5000`). Mientras esa ventana negra siga abierta, el panel funciona.
-4. Opcional:
-   - Logo: `logo.png` en `C:\racecore-redes`.
-   - Fuentes: `Titulo.ttf` y `Texto.ttf` en la carpeta `fuentes`.
+4. En **Ajustes**: sube tu **logo** (PNG sin fondo) y pon tus **redes**.
+   - Fuentes propias (opcional): `Titulo.ttf` y `Texto.ttf` en la carpeta `fuentes`.
 
 ## Actualizar el panel
 
@@ -21,7 +20,10 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
 ## B. Usar el panel
 
 - **Fotos**: crea categorías y sube fotos. Puedes elegir cientos a la vez: se suben de una en una.
-- **Publicaciones**: días o fecha, hora, antelación, categoría, formato y textos.
+- **Publicaciones**: días o fecha, hora, antelación, categoría, formato, diseño y textos.
+  - Diseño **Cartel**: título grande (lo que va entre `*asteriscos*` sale en color), franja
+    de color (la última línea sale más grande), datos separados con `|` y tus redes abajo.
+  - Diseño **Sencillo**: texto abajo con una etiqueta de color.
   - Variables: `{dia}` (sábado), `{fecha}` (27 de septiembre) y `{hora}` (18:00).
   - **Prompt IA**: si lo dejas vacío, se usa la foto tal cual. Si escribes algo, la IA
     rehace solo el fondo; el texto lo pone siempre el panel.

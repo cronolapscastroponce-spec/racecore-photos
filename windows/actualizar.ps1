@@ -5,12 +5,24 @@ $ProgressPreference = "SilentlyContinue"
 $base = "https://raw.githubusercontent.com/cronolapscastroponce-spec/racecore-photos/claude/clever-sagan-924ix1"
 $archivos = @(
     "app.py", "ia_fondo.py", "requirements.txt", "DESPLIEGUE.md", "fuentes/LEEME.txt",
+    "fuentes/Montserrat-BlackItalic.ttf", "fuentes/Montserrat-ExtraBoldItalic.ttf", "fuentes/OFL-Montserrat.txt",
     "1_instalar.bat", "2_probar.bat", "3_arranque_automatico.bat", "quitar_arranque_automatico.bat", "actualizar.bat",
     "windows/arrancar.bat", "windows/instalar_servicio.ps1", "windows/desinstalar_servicio.ps1", "windows/actualizar.ps1"
 )
 $carpeta = (Get-Location).Path
 if (-not (Test-Path (Join-Path $carpeta "app.py"))) {
     throw "Esto hay que ejecutarlo dentro de la carpeta del panel (donde esta app.py)."
+}
+
+# Si hay una version nueva de este mismo actualizador, se usa esa (puede traer archivos nuevos)
+if ($PSCommandPath) {
+    $nuevo = Join-Path $env:TEMP "racecore-actualizar.ps1"
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/windows/actualizar.ps1?v=$(Get-Random)" -OutFile $nuevo
+    if ((Get-FileHash $nuevo).Hash -ne (Get-FileHash $PSCommandPath).Hash) {
+        Copy-Item $nuevo $PSCommandPath -Force
+        & $PSCommandPath
+        return
+    }
 }
 
 Write-Host "Descargando la ultima version..."

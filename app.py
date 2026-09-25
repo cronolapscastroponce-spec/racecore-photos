@@ -24,7 +24,7 @@ from pathlib import Path
 import requests
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, url_for
 from jinja2 import DictLoader
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 import ia_fondo
 
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     categoria_id INTEGER, formato TEXT NOT NULL DEFAULT 'post',
     titulo TEXT NOT NULL DEFAULT '', subtitulo TEXT NOT NULL DEFAULT '', pie TEXT NOT NULL DEFAULT '',
     texto TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '#e10600',
-    prompt_ia TEXT NOT NULL DEFAULT '');
+    prompt_ia TEXT NOT NULL DEFAULT '', diseno TEXT NOT NULL DEFAULT 'cartel');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
@@ -138,6 +138,10 @@ def iniciar():
     c = conectar()
     try:
         c.executescript(ESQUEMA)
+        # Columnas añadidas en versiones posteriores
+        columnas = {f["name"] for f in c.execute("PRAGMA table_info(publicaciones)")}
+        if "diseno" not in columnas:
+            c.execute("ALTER TABLE publicaciones ADD COLUMN diseno TEXT NOT NULL DEFAULT 'cartel'")
         c.execute("PRAGMA journal_mode=WAL")
         # Lo que se quedó a medias por un reinicio
         c.execute("UPDATE generadas SET estado = 'error', aviso = 'Interrumpido: se reinició el panel' "
@@ -290,8 +294,8 @@ def fondo_liso(ancho, alto, color):
                            Image.new("RGB", (ancho, alto), arriba), mascara)
 
 
-def superponer(img, pub, occ):
-    """Título, subtítulo, pie (etiqueta de color) y logo sobre el fondo."""
+def superponer_sencillo(img, pub, occ):
+    """Diseño «Sencillo»: título, subtítulo y pie (etiqueta de color) abajo; logo arriba a la derecha."""
     W, H = img.size
     d = ImageDraw.Draw(img)
     acento = color_rgb(pub["color"])
@@ -300,9 +304,9 @@ def superponer(img, pub, occ):
     base = H - (int(H * 0.14) if story else margen)   # stories: libre la zona de la interfaz
     ancho_txt = W - 2 * margen
 
-    titulo = variables(pub["titulo"], occ).strip()
-    sub = variables(pub["subtitulo"], occ).strip()
-    pie = variables(pub["pie"], occ).strip()
+    titulo = sin_marcas(variables(pub["titulo"], occ)).strip()
+    sub = sin_marcas(variables(pub["subtitulo"], occ)).strip()
+    pie = sin_marcas(variables(pub["pie"], occ)).strip()
 
     # Título: se reduce hasta que quepa en 3 líneas
     tam = int(W * 0.095)
@@ -363,6 +367,344 @@ def superponer(img, pub, occ):
     return img
 
 
+# ---------------------------------------------------------------- diseño «Cartel»
+# Estilo cartel de competición: logo arriba a la izquierda, título enorme en cursiva
+# (lo que va entre *asteriscos* sale en color), franja de color tipo brochazo con el
+# destacado, datos con barras amarillas y las redes abajo.
+
+BLANCO = (255, 255, 255)
+AMARILLO = (247, 197, 0)
+REDES = ("facebook", "instagram", "tiktok", "web")
+_MEDIDOR = ImageDraw.Draw(Image.new("L", (1, 1)))
+
+
+@lru_cache(maxsize=128)
+def fuente_cartel(tipo, tam):
+    """Fuente propia si la hay; si no, las Montserrat incluidas; si no, las de Windows."""
+    propia = DIR_FUENTES / ("Titulo.ttf" if tipo == "titulo" else "Texto.ttf")
+    incluida = DIR_FUENTES / ("Montserrat-BlackItalic.ttf" if tipo == "titulo" else "Montserrat-ExtraBoldItalic.ttf")
+    for ruta in (propia, incluida):
+        if ruta.exists():
+            try:
+                return ImageFont.truetype(str(ruta), tam)
+            except OSError:
+                pass
+    return fuente("titulo" if tipo == "titulo" else "etiqueta", tam)
+
+
+def trozos(linea):
+    """«DE *RECORD*» -> [("DE ", False), ("RECORD", True)]"""
+    return [(t, i % 2 == 1) for i, t in enumerate(linea.split("*")) if t]
+
+
+def sin_marcas(texto):
+    return texto.replace("*", "")
+
+
+def alto_mayus(fnt):
+    return -fnt.getbbox("H", anchor="ls")[1]
+
+
+def partir_equilibrado(texto, fnt, ancho):
+    """Como partir(), pero si salen dos líneas las deja de largo parecido (sin palabras sueltas)."""
+    lineas = partir(_MEDIDOR, texto, fnt, ancho)
+    palabras = texto.split()
+    if len(lineas) != 2:
+        return lineas
+    opciones = [(" ".join(palabras[:i]), " ".join(palabras[i:])) for i in range(1, len(palabras))]
+    opciones = [o for o in opciones if max(fnt.getlength(o[0]), fnt.getlength(o[1])) <= ancho]
+    if not opciones:
+        return lineas
+    return list(min(opciones, key=lambda o: max(fnt.getlength(o[0]), fnt.getlength(o[1]))))
+
+
+def ajustar_tam(texto, tipo, ancho, tam_max, tam_min):
+    """Tamaño de letra para que el texto ocupe el ancho, sin pasar de tam_max."""
+    largo = fuente_cartel(tipo, 200).getlength(sin_marcas(texto)) or 1
+    return max(tam_min, min(tam_max, int(200 * ancho / largo)))
+
+
+def pintar(img, elementos, color_marca, sombra=0, opacidad=150):
+    """Dibuja textos [(x, y_base, texto, fuente, color)] con sombra suave opcional."""
+    if sombra:
+        mascara = Image.new("L", img.size, 0)
+        dm = ImageDraw.Draw(mascara)
+        for x, y, texto, fnt, _ in elementos:
+            dm.text((x, y), sin_marcas(texto), font=fnt, fill=opacidad, anchor="ls")
+        mascara = mascara.filter(ImageFilter.GaussianBlur(sombra))
+        mascara = ImageChops.offset(mascara, int(sombra * 0.3), int(sombra * 0.5))
+        img.paste((0, 0, 0), (0, 0) + img.size, mascara)
+    d = ImageDraw.Draw(img)
+    for x, y, texto, fnt, color in elementos:
+        for t, marcado in trozos(texto):
+            d.text((x, y), t, font=fnt, fill=color_marca if marcado else color, anchor="ls")
+            x += fnt.getlength(t)
+
+
+def oscurecer_cartel(img, fin_arriba, inicio_abajo):
+    """Viñeta + oscurecido arriba (título) y abajo (franja, datos, redes)."""
+    W, H = img.size
+    mascara = Image.radial_gradient("L").resize((W, H)).point(lambda v: int(v * 0.5))
+    if fin_arriba > 0:
+        arriba = Image.linear_gradient("L").rotate(180).resize((W, fin_arriba))
+        capa = Image.new("L", (W, H), 0)
+        capa.paste(arriba.point(lambda v: int(215 * (v / 255) ** 1.4)), (0, 0))
+        mascara = ImageChops.lighter(mascara, capa)
+    if inicio_abajo < H:
+        abajo = Image.linear_gradient("L").resize((W, H - inicio_abajo))
+        capa = Image.new("L", (W, H), 0)
+        capa.paste(abajo.point(lambda v: int(240 * (v / 255) ** 0.9)), (0, inicio_abajo))
+        mascara = ImageChops.lighter(mascara, capa)
+    img.paste((0, 0, 0), (0, 0) + img.size, mascara)
+
+
+def brochazo(ancho, alto, color, rnd):
+    """Franja de color con bordes rasgados, como un trazo de pintura (RGBA)."""
+    margen = int(ancho * 0.06)
+    capa = Image.new("RGBA", (ancho + 2 * margen, alto), (0, 0, 0, 0))
+    d = ImageDraw.Draw(capa)
+    x0, x1 = margen, margen + ancho
+    pasos = 10
+    borde = [(x0 + ancho * i / pasos, rnd.uniform(0, alto * 0.05)) for i in range(pasos + 1)]
+    borde += [(x1 - rnd.uniform(0, ancho * 0.035), alto * j / 8) for j in range(1, 8)]
+    borde += [(x1 - ancho * i / pasos, alto - rnd.uniform(0, alto * 0.05)) for i in range(pasos + 1)]
+    borde += [(x0 + rnd.uniform(0, ancho * 0.035), alto * (8 - j) / 8) for j in range(1, 8)]
+    d.polygon(borde, fill=color + (255,))
+    # vetas del pincel que se salen por los extremos
+    for _ in range(14):
+        grosor = alto * rnd.uniform(0.02, 0.07)
+        y = rnd.uniform(0, alto - grosor)
+        izq = x0 - rnd.uniform(-ancho * 0.02, margen * 0.9)
+        der = x1 + rnd.uniform(-ancho * 0.02, margen * 0.9)
+        d.rectangle([izq, y, der, y + grosor], fill=color + (rnd.randint(150, 255),))
+    # textura: vetas algo más oscuras dentro
+    oscuro = tuple(int(c * 0.82) for c in color)
+    for _ in range(10):
+        grosor = alto * rnd.uniform(0.01, 0.03)
+        y = rnd.uniform(alto * 0.08, alto * 0.92)
+        a = x0 + rnd.uniform(0, ancho * 0.5)
+        d.rectangle([a, y, a + rnd.uniform(ancho * 0.2, ancho * 0.5), y + grosor], fill=oscuro + (70,))
+    return capa.filter(ImageFilter.GaussianBlur(0.8))
+
+
+def icono_red(tipo, lado):
+    """Icono blanco de red social (máscara L), dibujado a 4x y reducido para que salga suave."""
+    L = lado * 4
+    m = Image.new("L", (L, L), 0)
+    d = ImageDraw.Draw(m)
+    g = max(3, int(L * 0.09))
+    if tipo == "facebook":
+        d.ellipse([0, 0, L - 1, L - 1], fill=255)
+        d.text((L * 0.56, L * 1.0), "f", font=fuente_cartel("titulo", int(L * 0.85)), fill=0, anchor="ms")
+    elif tipo == "instagram":
+        d.rounded_rectangle([g / 2, g / 2, L - g / 2, L - g / 2], radius=int(L * 0.28), outline=255, width=g)
+        d.ellipse([L * 0.29, L * 0.29, L * 0.71, L * 0.71], outline=255, width=g)
+        d.ellipse([L * 0.69, L * 0.17, L * 0.81, L * 0.29], fill=255)
+    elif tipo == "tiktok":
+        d.ellipse([L * 0.12, L * 0.52, L * 0.54, L * 0.94], outline=255, width=int(g * 1.3))
+        d.rectangle([L * 0.54 - g * 1.3, L * 0.06, L * 0.54, L * 0.73], fill=255)
+        d.arc([L * 0.5, L * -0.2, L * 0.94, L * 0.34], start=90, end=180, fill=255, width=int(g * 1.3))
+    else:  # web
+        d.ellipse([g / 2, g / 2, L - g / 2, L - g / 2], outline=255, width=g)
+        d.ellipse([L * 0.3, g / 2, L * 0.7, L - g / 2], outline=255, width=g)
+        d.line([(g, L / 2), (L - g, L / 2)], fill=255, width=g)
+        d.line([(L * 0.14, L * 0.3), (L * 0.86, L * 0.3)], fill=255, width=g)
+        d.line([(L * 0.14, L * 0.7), (L * 0.86, L * 0.7)], fill=255, width=g)
+    return m.resize((lado, lado), Image.LANCZOS)
+
+
+def bloque_logo(W, H, escala):
+    if not LOGO.exists():
+        return None
+    with Image.open(LOGO) as lg:
+        lg = lg.convert("RGBA")
+    lg.thumbnail((int(W * 0.46 * escala), int(min(W * 0.2, H * 0.13) * escala)), Image.LANCZOS)
+    margen = int(W * 0.05)
+
+    def dibujar(img, y):
+        img.paste(lg, (margen, y), lg)
+    return lg.height, dibujar
+
+
+def bloque_titulo(texto, W, acento, escala):
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+    if not lineas:
+        return None
+    margen = int(W * 0.06)
+    ancho = W - 2 * margen
+    tam_max, tam_min = int(W * 0.2 * escala), int(W * 0.05 * escala)
+    # Una línea muy larga se parte en dos para que la letra no quede pequeña
+    partidas = []
+    for l in lineas:
+        palabras = l.split()
+        if len(palabras) > 1 and ajustar_tam(l, "titulo", ancho, tam_max, 1) < W * 0.11 * escala:
+            corte = min(range(1, len(palabras)), key=lambda i: abs(
+                len(" ".join(palabras[:i])) - len(" ".join(palabras[i:]))))
+            partidas += [" ".join(palabras[:corte]), " ".join(palabras[corte:])]
+        else:
+            partidas.append(l)
+    filas = []
+    for l in partidas:
+        f = fuente_cartel("titulo", ajustar_tam(l, "titulo", ancho, tam_max, tam_min))
+        filas.append((l, f, alto_mayus(f)))
+    raya = int(W * 0.05 * escala)
+    alto = sum(int(c * 1.3) for _, _, c in filas) - int(filas[-1][2] * 0.3) + raya
+
+    def dibujar(img, y):
+        elementos = []
+        for l, f, cap in filas:
+            y += cap
+            elementos.append((margen, y, l, f, BLANCO))
+            y += int(cap * 0.3)
+        pintar(img, elementos, acento, sombra=max(4, int(W * 0.012)))
+        # raya de color inclinada bajo el título
+        y += int(raya * 0.45)
+        grosor = max(3, int(W * 0.008))
+        ImageDraw.Draw(img).polygon([(margen + W * 0.08, y + grosor), (W - margen * 0.4, y - raya * 0.35),
+                                     (W - margen * 0.4, y - raya * 0.35 + 2), (margen + W * 0.08, y + 2 * grosor)],
+                                    fill=acento)
+    return alto, dibujar
+
+
+def bloque_franja(texto, W, acento, escala, rnd):
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+    if not lineas:
+        return None
+    ancho_txt = W * 0.76
+    filas = []
+    for i, l in enumerate(lineas):
+        grande = i == len(lineas) - 1
+        tam_max = int(W * (0.12 if grande else 0.072) * escala)
+        f = fuente_cartel("titulo", ajustar_tam(l, "titulo", ancho_txt, tam_max, int(W * 0.035)))
+        filas.append((l, f, alto_mayus(f)))
+    alto_txt = sum(int(c * 1.32) for _, _, c in filas) - int(filas[-1][2] * 0.32)
+    pad = int(W * 0.05 * escala)
+    alto_franja = alto_txt + 2 * pad
+    extra = int(W * 0.04)  # lo que sube/baja al inclinarla
+    color_marca = AMARILLO if sum(acento) < 600 else (0, 0, 0)
+
+    def dibujar(img, y):
+        capa = brochazo(int(W * 0.9), alto_franja, acento, rnd).rotate(2.5, Image.BICUBIC, expand=True)
+        cx, cy = W // 2, y + (alto_franja + 2 * extra) // 2
+        img.paste(capa, (cx - capa.width // 2, cy - capa.height // 2), capa)
+        ty = cy - alto_txt // 2
+        elementos = []
+        for l, f, cap in filas:
+            ty += cap
+            elementos.append((cx - f.getlength(sin_marcas(l)) / 2, ty, l, f, BLANCO))
+            ty += int(cap * 0.32)
+        pintar(img, elementos, color_marca, sombra=max(3, int(W * 0.006)), opacidad=110)
+    return alto_franja + 2 * extra, dibujar
+
+
+def bloque_datos(texto, W, escala):
+    items = [x.strip() for x in texto.split("|") if x.strip()][:3]
+    if not items:
+        return None
+    hueco, barra, sep = int(W * 0.06), max(4, int(W * 0.007)), int(W * 0.022)
+    ancho_col = (W - 2 * int(W * 0.06) - hueco * (len(items) - 1)) / len(items) - barra - sep
+    tam = int(W * 0.042 * escala)
+    while True:
+        f = fuente_cartel("texto", tam)
+        filas = [partir_equilibrado(sin_marcas(it), f, ancho_col) for it in items]
+        if all(len(x) <= 2 for x in filas) or tam <= W * 0.024:
+            break
+        tam = int(tam * 0.92)
+    cap = alto_mayus(f)
+    lh = int(cap * 1.5)
+    alto = max(len(x) for x in filas) * lh - (lh - cap)
+    anchos = [barra + sep + max(f.getlength(l) for l in fl) for fl in filas]
+    total = sum(anchos) + hueco * (len(items) - 1)
+
+    def dibujar(img, y):
+        d = ImageDraw.Draw(img)
+        x = (W - total) / 2
+        elementos = []
+        for fl, ancho in zip(filas, anchos):
+            alto_item = len(fl) * lh - (lh - cap)
+            y0 = y + (alto - alto_item) / 2
+            d.rectangle([x, y0 - cap * 0.15, x + barra, y0 + alto_item + cap * 0.15], fill=AMARILLO)
+            ty = y0
+            for l in fl:
+                ty += cap
+                elementos.append((x + barra + sep, ty, l, f, BLANCO))
+                ty += lh - cap
+            x += ancho + hueco
+        pintar(img, elementos, AMARILLO, sombra=max(3, int(W * 0.006)))
+    return alto, dibujar
+
+
+def bloque_redes(redes, W, escala):
+    if not redes:
+        return None
+    tam = int(W * 0.024 * escala)
+    while True:
+        f = fuente("texto", tam)
+        lado = int(tam * 1.6)
+        barra, sep, hueco = max(2, int(tam * 0.12)), int(tam * 0.5), int(tam * 1.4)
+        anchos = [lado + 2 * sep + barra + f.getlength(h) for _, h in redes]
+        total = sum(anchos) + hueco * (len(redes) - 1)
+        if total <= W * 0.94 or tam <= 12:
+            break
+        tam -= 1
+
+    def dibujar(img, y):
+        d = ImageDraw.Draw(img)
+        x = (W - total) / 2
+        for (tipo, handle), ancho in zip(redes, anchos):
+            img.paste(BLANCO, (int(x), y), icono_red(tipo, lado))
+            bx = x + lado + sep
+            d.rectangle([bx, y + lado * 0.1, bx + barra, y + lado * 0.9], fill=AMARILLO)
+            d.text((bx + barra + sep, y + lado / 2), handle, font=f, fill=BLANCO, anchor="lm")
+            x += ancho + hueco
+    return lado, dibujar
+
+
+def superponer_cartel(img, pub, occ):
+    W, H = img.size
+    story = H / W > 1.6
+    arriba = int(H * 0.09) if story else int(W * 0.045)
+    abajo = H - (int(H * 0.12) if story else int(W * 0.04))
+    acento = color_rgb(pub["color"])
+    titulo = variables(pub["titulo"], occ).upper()
+    franja = variables(pub["subtitulo"], occ).upper()
+    datos = variables(pub["pie"], occ).upper()
+    redes = [(t, ajuste(f"red_{t}")) for t in REDES if ajuste(f"red_{t}")]
+
+    # Foto con más garra: algo más de contraste y color
+    img = ImageEnhance.Contrast(ImageEnhance.Color(img).enhance(1.15)).enhance(1.08)
+
+    # Se reduce todo hasta que quede hueco en medio para la foto
+    for escala in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5):
+        rnd = random.Random(f"{pub['id']}-{occ}")
+        de_arriba = [b for b in (bloque_logo(W, H, escala), bloque_titulo(titulo, W, acento, escala)) if b]
+        de_abajo = [b for b in (bloque_franja(franja, W, acento, escala, rnd), bloque_datos(datos, W, escala),
+                                bloque_redes(redes, W, escala)) if b]
+        hueco = int(W * 0.035 * escala)
+        alto_arriba = sum(a for a, _ in de_arriba) + hueco * max(0, len(de_arriba) - 1)
+        alto_abajo = sum(a for a, _ in de_abajo) + hueco * max(0, len(de_abajo) - 1)
+        if arriba + alto_arriba + H * 0.1 <= abajo - alto_abajo:
+            break
+
+    oscurecer_cartel(img, arriba + alto_arriba + int(H * 0.12) if de_arriba else 0,
+                     abajo - alto_abajo - int(H * 0.15) if de_abajo else H)
+    y = arriba
+    for alto, dibujar in de_arriba:
+        dibujar(img, y)
+        y += alto + hueco
+    y = abajo - alto_abajo
+    for alto, dibujar in de_abajo:
+        dibujar(img, y)
+        y += alto + hueco
+    return img
+
+
+def superponer(img, pub, occ):
+    if pub["diseno"] == "sencillo":
+        return superponer_sencillo(img, pub, occ)
+    return superponer_cartel(img, pub, occ)
+
+
 def elegir_foto(pub_id, fotos, evitar=None):
     """Una al azar, sin repetir «evitar» ni, si no se indica, la última usada en esta publicación."""
     if not fotos:
@@ -387,11 +729,9 @@ def componer(pub, occ, evitar=None):
         fondo = fondo_liso(ancho, alto, pub["color"])
     else:
         ruta = DIR_FOTOS / foto["archivo"]
-        if pub["prompt_ia"].strip():
-            clave = ajuste("openai_key")
-            if not clave:
-                avisos.append("IA: falta la clave de OpenAI (menú Ajustes). Se ha usado la foto original.")
-            else:
+        clave = ajuste("openai_key")
+        if pub["prompt_ia"].strip() and clave:  # sin clave de OpenAI la IA simplemente no se usa
+            if True:
                 try:
                     fondo = ia_fondo.generar_fondo(ruta, pub["prompt_ia"], ancho, alto, clave,
                                                    calidad=ajuste("openai_calidad", "medium"))
@@ -576,7 +916,8 @@ def borrar_generada(gen_id):
 
 NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "fecha": "",
          "hora": "18:00", "antelacion": 1440, "categoria_id": None, "formato": "post",
-         "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e10600", "prompt_ia": ""}
+         "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
+         "diseno": "cartel"}
 
 
 @app.route("/publicaciones")
@@ -627,12 +968,13 @@ def leer_formulario():
         "antelacion": antelacion,
         "categoria_id": categoria_id,
         "formato": f.get("formato") if f.get("formato") in FORMATOS else "post",
-        "titulo": f.get("titulo", "").strip(),
-        "subtitulo": f.get("subtitulo", "").strip(),
+        "titulo": f.get("titulo", "").strip().replace("\r", ""),
+        "subtitulo": f.get("subtitulo", "").strip().replace("\r", ""),
         "pie": f.get("pie", "").strip(),
         "texto": f.get("texto", "").strip(),
         "color": color,
         "prompt_ia": f.get("prompt_ia", "").strip(),
+        "diseno": "sencillo" if f.get("diseno") == "sencillo" else "cartel",
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
@@ -669,7 +1011,7 @@ def editar_publicacion(pub_id=None):
             return redirect(url_for("publicaciones"))
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
-                           dias_marcados=set(str(pub["dias"]).split(",")))
+                           dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")))
 
 
 @app.post("/publicaciones/<int:pub_id>/generar")
@@ -817,6 +1159,8 @@ def ajustes():
             elif nuevo:
                 guardar_ajuste(clave, nuevo)
         guardar_ajuste("telegram_chat", request.form.get("telegram_chat", "").strip())
+        for red in REDES:
+            guardar_ajuste(f"red_{red}", request.form.get(f"red_{red}", "").strip())
         calidad = request.form.get("openai_calidad", "medium")
         guardar_ajuste("openai_calidad", calidad if calidad in ("low", "medium", "high") else "medium")
         flash("Ajustes guardados.", "ok")
@@ -830,8 +1174,41 @@ def ajustes():
     return render_template(
         "ajustes.html", openai_key=oculta("openai_key"), telegram_token=oculta("telegram_token"),
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
-        ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE, hay_logo=LOGO.exists(),
+        ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
+        logo_v=int(LOGO.stat().st_mtime) if LOGO.exists() else 0, redes={r: ajuste(f"red_{r}") for r in REDES},
         fuentes=[n for n in ("Titulo.ttf", "Texto.ttf") if (DIR_FUENTES / n).exists()])
+
+
+@app.route("/logo.png")
+def ver_logo():
+    if not LOGO.exists():
+        abort(404)
+    return send_from_directory(BASE, LOGO.name, max_age=0)
+
+
+@app.post("/ajustes/logo")
+def subir_logo():
+    if request.form.get("quitar"):
+        LOGO.unlink(missing_ok=True)
+        flash("Logo quitado.", "ok")
+        return redirect(url_for("ajustes"))
+    f = request.files.get("logo")
+    try:
+        with Image.open(f.stream) as im:
+            im = ImageOps.exif_transpose(im).convert("RGBA")
+        transparente = im.getchannel("A").getextrema()[0] < 250
+        caja = im.getchannel("A").getbbox()  # recorta los bordes transparentes
+        if caja:
+            im = im.crop(caja)
+        im.thumbnail((1600, 1600), Image.LANCZOS)
+        im.save(LOGO, "PNG")
+    except Exception:
+        flash("Ese archivo no es una imagen válida.", "error")
+        return redirect(url_for("ajustes"))
+    flash("Logo guardado." if transparente else
+          "Logo guardado, pero no tiene fondo transparente: se verá como un recuadro. Mejor un PNG sin fondo.",
+          "ok" if transparente else "error")
+    return redirect(url_for("ajustes"))
 
 
 @app.post("/ajustes/telegram")
@@ -1046,16 +1423,29 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
     <div><label>Formato</label>
       <select name="formato">{% for clave, f in formatos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.formato }}>{{ f[0] }}</option>{% endfor %}</select></div>
   </div>
-  <label>Título</label><input type="text" name="titulo" value="{{ pub.titulo }}" placeholder="Ej: Tanda nocturna">
-  <label>Subtítulo</label><input type="text" name="subtitulo" value="{{ pub.subtitulo }}" placeholder="Ej: Este {dia} a las {hora}">
   <div class="dos">
-    <div><label>Pie (etiqueta de color)</label><input type="text" name="pie" value="{{ pub.pie }}" placeholder="Ej: 25 € · Reserva ya"></div>
+    <div><label>Diseño</label>
+      <select name="diseno">
+        <option value="cartel" {{ 'selected' if pub.diseno != 'sencillo' }}>Cartel (título grande, franja de color, datos y redes)</option>
+        <option value="sencillo" {{ 'selected' if pub.diseno == 'sencillo' }}>Sencillo (texto abajo)</option>
+      </select></div>
     <div><label>Color de acento</label><input type="color" name="color" value="{{ pub.color }}"></div>
   </div>
+  <label>Título</label>
+  <textarea name="titulo" rows="2" style="min-height:0" placeholder="Ej:&#10;{dia}&#10;DE *RECORD !!*">{{ pub.titulo }}</textarea>
+  <div class="ayuda">Enter = nueva línea. Lo que pongas *entre asteriscos* sale en el color de acento.</div>
+  <label>Franja de color / subtítulo</label>
+  <textarea name="subtitulo" rows="2" style="min-height:0" placeholder="Ej:&#10;El mejor tiempo&#10;no paga">{{ pub.subtitulo }}</textarea>
+  <div class="ayuda">En «Cartel» va dentro de la franja de color y la última línea sale más grande.</div>
+  <label>Datos / pie</label>
+  <input type="text" name="pie" value="{{ pub.pie }}" placeholder="Ej: Grupo mínimo 6 corredores | Reserva necesaria">
+  <div class="ayuda">En «Cartel», separa cada dato con | (salen con una barra amarilla). En «Sencillo» es la etiqueta de color.</div>
+  {% if hay_ia %}
   <label>Prompt IA (opcional)</label>
   <textarea name="prompt_ia" placeholder="Vacío = la foto tal cual. Ej: atardecer dorado, luz cálida, ambiente de competición">{{ pub.prompt_ia }}</textarea>
   <div class="ayuda">La IA solo cambia el fondo a partir de una de tus fotos. El texto lo pone siempre el panel.</div>
-  <div class="ayuda">En título, subtítulo y pie no uses emojis: en la imagen salen como cuadrados. En el texto del post sí.</div>
+  {% else %}<input type="hidden" name="prompt_ia" value="{{ pub.prompt_ia }}">{% endif %}
+  <div class="ayuda">En la imagen no uses emojis (salen como cuadrados). En el texto del post sí.</div>
 </div>
 
 <div class="caja">
@@ -1165,9 +1555,31 @@ document.getElementById('subida').addEventListener('submit', async (ev) => {
 PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 {% block contenido %}
 <h1>Ajustes</h1>
+<form class="caja" method="post" enctype="multipart/form-data" action="{{ url_for('subir_logo') }}">
+  <b>Logo</b>
+  <div class="ayuda">Sale en todas las imágenes. Mejor un PNG con fondo transparente.</div>
+  {% if logo_v %}<div style="background:#555; display:inline-block; padding:10px; border-radius:8px; margin:10px 0">
+    <img src="{{ url_for('ver_logo', v=logo_v) }}" alt="" style="max-height:90px; max-width:260px; display:block"></div>{% endif %}
+  <div class="fila" style="margin-top:8px">
+    <input type="file" name="logo" accept="image/png,image/jpeg,image/webp">
+    <button class="principal">Subir logo</button>
+    {% if logo_v %}<button name="quitar" value="1" class="peligro" formnovalidate>Quitar logo</button>{% endif %}
+  </div>
+</form>
 <form method="post">
 <div class="caja">
-  <b>IA (OpenAI)</b>
+  <b>Redes (salen abajo en el diseño «Cartel»)</b>
+  <div class="ayuda">Deja vacías las que no quieras que salgan.</div>
+  <div class="dos">
+    <div><label>Facebook</label><input type="text" name="red_facebook" value="{{ redes.facebook }}" placeholder="kartingcastroponce"></div>
+    <div><label>Instagram</label><input type="text" name="red_instagram" value="{{ redes.instagram }}" placeholder="karting_castroponce"></div>
+    <div><label>TikTok</label><input type="text" name="red_tiktok" value="{{ redes.tiktok }}" placeholder="karting_castroponce"></div>
+    <div><label>Web</label><input type="text" name="red_web" value="{{ redes.web }}" placeholder="kartingcastroponce.com"></div>
+  </div>
+</div>
+<div class="caja">
+  <b>IA de OpenAI (opcional, de pago aparte)</b>
+  <div class="ayuda">Sin clave, el panel usa tus fotos tal cual. Con clave aparece el campo «Prompt IA» en las publicaciones.</div>
   <label>Clave de la API {% if openai_key %}<span class="chip on">{{ openai_key }}</span>{% endif %}</label>
   <input type="password" name="openai_key" placeholder="{{ 'Déjalo vacío para no cambiarla' if openai_key else 'sk-...' }}" autocomplete="off">
   {% if openai_key %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_openai_key" value="1"> Quitar la clave</label>{% endif %}
@@ -1193,8 +1605,7 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 <h2>Estado</h2>
 <div class="caja">
   <div>Programador: {% if ultima %}<span class="chip on">funcionando</span> última comprobación {{ ultima }}{% else %}<span class="chip">arrancando…</span>{% endif %}</div>
-  <div>Logo: {% if hay_logo %}<span class="chip on">logo.png encontrado</span>{% else %}<span class="chip">no hay</span> <span class="ayuda">pon un archivo logo.png en la carpeta del panel</span>{% endif %}</div>
-  <div>Fuentes propias: {% if fuentes %}<span class="chip on">{{ fuentes|join(', ') }}</span>{% else %}<span class="chip">las de Windows</span> <span class="ayuda">opcional: Titulo.ttf y Texto.ttf en la carpeta «fuentes»</span>{% endif %}</div>
+  <div>Fuentes propias: {% if fuentes %}<span class="chip on">{{ fuentes|join(', ') }}</span>{% else %}<span class="chip">las incluidas</span> <span class="ayuda">opcional: Titulo.ttf y Texto.ttf en la carpeta «fuentes»</span>{% endif %}</div>
   <div class="ayuda" style="margin-top:8px">Carpeta del panel: {{ carpeta }}</div>
 </div>
 {% endblock %}"""

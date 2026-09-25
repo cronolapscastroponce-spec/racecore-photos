@@ -17,8 +17,8 @@ REGLAS = """
 Reglas obligatorias:
 - Parte de la foto adjunta: mismo circuito de karting, mismos karts y ambiente. Resultado fotográfico y realista.
 - NO añadas ningún texto, letra, número, logotipo, cartel legible ni marca de agua.
-- Deja el tercio inferior de la imagen sencillo y con poco detalle: ahí se pondrá el texto después.
-- Deja despejada la esquina superior derecha: ahí irá el logo.
+- El protagonista (kart, piloto) en el centro de la imagen.
+- Deja la franja de arriba y el tercio de abajo sencillos y con poco detalle: ahí irán el logo y el texto.
 """.strip()
 
 

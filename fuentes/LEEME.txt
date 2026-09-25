@@ -1,7 +1,9 @@
-Opcional: pon aqui tus fuentes con estos nombres exactos:
+El panel ya trae la tipografia Montserrat (Black y ExtraBold Italic), libre
+(licencia en OFL-Montserrat.txt). Es la que usa el diseno "Cartel".
 
-  Titulo.ttf  -> para el titulo
-  Texto.ttf   -> para el subtitulo y el pie
+Si quieres usar la tuya, pon aqui estos archivos con estos nombres exactos:
 
-Si no hay ninguna, el panel usa las de Windows (Arial Black y Arial).
-El logo va en la carpeta principal del panel, con el nombre logo.png
+  Titulo.ttf  -> titulos y franja de color
+  Texto.ttf   -> datos, subtitulo y pie
+
+El logo se sube desde el panel: Ajustes > Logo.
