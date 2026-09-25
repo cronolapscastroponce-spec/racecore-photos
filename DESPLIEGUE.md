@@ -28,6 +28,8 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Diseño **IA completa** (con clave de OpenAI): la IA hace el cartel con tus textos a partir de
     la foto; el panel pone siempre encima el logo y las redes. Si la IA falla, sale el Cartel.
   - Variables: `{dia}` (sábado), `{fecha}` (27 de septiembre) y `{hora}` (18:00).
+  - **Varias versiones**: en Título, Franja y Texto del post, sepáralas con una línea `---` y
+    el panel las va turnando (1ª, 2ª, 3ª…). La 2ª del título sale con la 2ª del texto.
   - **Prompt IA**: si lo dejas vacío, se usa la foto tal cual. Si escribes algo, la IA
     rehace solo el fondo; el texto lo pone siempre el panel.
 - **Listas para publicar**: las imágenes aparecen solas antes de su hora. Desde ahí:
@@ -56,6 +58,10 @@ de cada evento: recordatorios, horarios, inscritos, resultados…
    - **Condición**: siempre, solo con la inscripción abierta, solo si quedan plazas o solo
      cuando haya resultados (si aún no los hay, lo vuelve a mirar hasta la hora).
    - **Solo los eventos que contengan**: para campañas de un campeonato concreto.
+   - **Fotos por evento**: en la pestaña Eventos, a cada evento le puedes elegir su categoría
+     de fotos (motos, alquiler…). Si no eliges, usa la de cada publicación.
+   - **Duplicar** (en Publicaciones) hace una copia en pausa para crear variantes. Si borras
+     alguna de las de ejemplo, en Eventos sale un botón para volver a crearla.
    - Variables: `{evento}` `{campeonato}` `{dia}` `{fecha}` `{hora}` (del evento), `{dias}`,
      `{faltan}` («en 5 días», «mañana»), `{inscritos}` `{plazas}` `{libres}` `{precio}`,
      `{enlace}` (inscripción), `{web}`, `{horarios}`, `{resultados}` y `{ganadores}`.

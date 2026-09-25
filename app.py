@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS eventos (
     plazas INTEGER, inscritos INTEGER, precio TEXT NOT NULL DEFAULT '', abierta INTEGER NOT NULL DEFAULT 0,
     enlace TEXT NOT NULL DEFAULT '', web TEXT NOT NULL DEFAULT '', horarios TEXT NOT NULL DEFAULT '',
     resultados TEXT NOT NULL DEFAULT '', ganadores TEXT NOT NULL DEFAULT '', actualizado TEXT NOT NULL DEFAULT '',
-    UNIQUE (origen, ext_id));
+    categoria_id INTEGER, UNIQUE (origen, ext_id));
 """
 
 
@@ -171,7 +171,8 @@ def iniciar():
                                     "filtro": "TEXT NOT NULL DEFAULT ''",
                                     "condicion": "TEXT NOT NULL DEFAULT ''"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
-                                "evento_id": "INTEGER NOT NULL DEFAULT 0"}}
+                                "evento_id": "INTEGER NOT NULL DEFAULT 0"},
+                  "eventos": {"categoria_id": "INTEGER"}}
         for tabla, cols in nuevas.items():
             existentes = {f["name"] for f in c.execute(f"PRAGMA table_info({tabla})")}
             for col, tipo in cols.items():
@@ -597,6 +598,8 @@ def con_evento(pub, ev, occ):
         for clave, valor in valores.items():
             datos[campo] = (datos[campo] or "").replace(clave, valor or "")
     datos["nombre"] = f"{pub['nombre']} · {ev['nombre']}"
+    if ev["categoria_id"]:  # fotos elegidas para este evento (motos, alquiler...)
+        datos["categoria_id"] = ev["categoria_id"]
     datos["_aviso"] = ""
     if ev["origen"] == "racecore" and ev["actualizado"]:
         leido = datetime.strptime(ev["actualizado"], "%Y-%m-%d %H:%M:%S")
@@ -1590,6 +1593,18 @@ def generar_ahora(pub_id):
     return redirect(url_for("listas"))
 
 
+@app.post("/publicaciones/<int:pub_id>/duplicar")
+def duplicar_publicacion(pub_id):
+    """Copia en pausa, para hacer una variante (otro texto, otros eventos...)."""
+    datos = {k: v for k, v in dict(pub_o_404(pub_id)).items() if k != "id"}
+    datos |= {"nombre": f"{datos['nombre']} (copia)", "activa": 0}
+    campos = list(datos)
+    nuevo = ejecutar(f"INSERT INTO publicaciones ({', '.join(campos)}) VALUES ({', '.join('?' for _ in campos)})",
+                     [datos[c] for c in campos]).lastrowid
+    flash("Copia creada en pausa. Cámbiale lo que quieras y actívala.", "ok")
+    return redirect(url_for("editar_publicacion", pub_id=nuevo))
+
+
 @app.post("/publicaciones/<int:pub_id>/activar")
 def activar_publicacion(pub_id):
     pub = pub_o_404(pub_id)
@@ -1655,8 +1670,26 @@ def eventos():
         })
     filas.sort(key=lambda e: e["orden"])
     hay_reglas = bool(consulta("SELECT 1 FROM publicaciones WHERE modo = 'evento' LIMIT 1"))
+    faltan = sum(1 for e in EJEMPLOS if not consulta("SELECT 1 FROM publicaciones WHERE nombre = ?", (e["nombre"],)))
     return render_template("eventos.html", eventos=filas, racecore=estado_racecore(), hay_reglas=hay_reglas,
-                           hay_activas=bool(reglas))
+                           hay_activas=bool(reglas), faltan_ejemplos=faltan,
+                           categorias=consulta("SELECT * FROM categorias ORDER BY nombre"))
+
+
+@app.post("/eventos/<int:ev_id>/fotos")
+def fotos_evento(ev_id):
+    """Categoría de fotos de un evento (vacío = la de cada publicación)."""
+    if not consulta("SELECT 1 FROM eventos WHERE id = ?", (ev_id,)):
+        abort(404)
+    try:
+        cat_id = int(request.form.get("categoria_id") or 0) or None
+    except ValueError:
+        cat_id = None
+    if cat_id and not consulta("SELECT 1 FROM categorias WHERE id = ?", (cat_id,)):
+        cat_id = None
+    ejecutar("UPDATE eventos SET categoria_id = ? WHERE id = ?", (cat_id, ev_id))
+    flash("Fotos del evento guardadas.", "ok")
+    return redirect(url_for("eventos"))
 
 
 @app.post("/eventos/leer")
@@ -1872,6 +1905,7 @@ def borrar_categoria(cat_id):
         borrar_archivos_foto(foto)
     ejecutar("DELETE FROM fotos WHERE categoria_id = ?", (cat_id,))
     ejecutar("UPDATE publicaciones SET categoria_id = NULL WHERE categoria_id = ?", (cat_id,))
+    ejecutar("UPDATE eventos SET categoria_id = NULL WHERE categoria_id = ?", (cat_id,))
     ejecutar("DELETE FROM categorias WHERE id = ?", (cat_id,))
     flash("Categoría borrada.", "ok")
     return redirect(url_for("fotos"))
@@ -2133,6 +2167,7 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
     <div class="fila">
       <a class="boton" href="{{ url_for('editar_publicacion', pub_id=p.id) }}">Editar</a>
       <form class="enlinea" method="post" action="{{ url_for('generar_ahora', pub_id=p.id) }}"><button>Generar ahora</button></form>
+      <form class="enlinea" method="post" action="{{ url_for('duplicar_publicacion', pub_id=p.id) }}"><button>Duplicar</button></form>
       <form class="enlinea" method="post" action="{{ url_for('activar_publicacion', pub_id=p.id) }}"><button>{{ 'Pausar' if p.activa else 'Activar' }}</button></form>
       <form class="enlinea" method="post" action="{{ url_for('borrar_publicacion', pub_id=p.id) }}" onsubmit="return confirm('¿Borrar la publicación «{{ p.nombre }}»?')"><button class="peligro">Borrar</button></form>
     </div>
@@ -2475,6 +2510,14 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
       {% if ev.cuando %}<div class="ayuda">{{ ev.cuando }}{% if ev.campeonato %} · {{ ev.campeonato }}{% endif %}</div>
       {% else %}<div class="aviso">{% if ev.fecha_txt %}No entiendo la fecha «{{ ev.fecha_txt }}»{% else %}No tiene fecha{% endif %}: para este evento no se programa nada.</div>{% endif %}
       <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
+      <form method="post" action="{{ url_for('fotos_evento', ev_id=ev.id) }}" class="fila" style="margin-top:6px">
+        <span class="ayuda">Fotos:</span>
+        <select name="categoria_id" onchange="this.form.submit()" style="width:auto">
+          <option value="">las de cada publicación</option>
+          {% for c in categorias %}<option value="{{ c.id }}" {{ 'selected' if c.id == ev.categoria_id }}>{{ c.nombre }}</option>{% endfor %}
+        </select>
+        <noscript><button>Guardar</button></noscript>
+      </form>
     </div>
     {% if ev.origen == 'manual' %}<div class="fila">
       <a class="boton" href="{{ url_for('editar_evento', ev_id=ev.id) }}">Editar</a>
@@ -2500,6 +2543,11 @@ Resultados:
 {% else %}
 <div class="vacio">No hay eventos.<br>Conecta Racecore en Ajustes o crea uno con «+ Evento a mano».</div>
 {% endfor %}
+{% if hay_reglas and faltan_ejemplos %}
+<form method="post" action="{{ url_for('crear_ejemplos') }}" style="margin-top:20px">
+  <button>Volver a crear las de ejemplo que faltan ({{ faltan_ejemplos }})</button>
+</form>
+{% endif %}
 {% endblock %}"""
 
 PLANTILLAS["evento.html"] = """{% extends "base.html" %}
