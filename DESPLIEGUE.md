@@ -57,8 +57,9 @@ de cada evento: recordatorios, horarios, inscritos, resultados…
      evento; «de 14 a 3 días, cada 2» publica a 14, 12, 10, 8, 6 y 4 días.
    - **Condición**: siempre, solo con la inscripción abierta, solo si quedan plazas o solo
      cuando haya resultados (si aún no los hay, lo vuelve a mirar hasta la hora).
-   - **Solo para estos eventos**: elige un campeonato (vale también para sus carreras futuras)
-     o un evento de la lista, o escribe parte del nombre. Debajo dice a qué eventos se aplica.
+   - **¿Para qué eventos?**: marca uno o varios campeonatos (valen también para sus carreras
+     futuras) y/o eventos sueltos, o escribe un texto. Sin marcar nada, para todos. Debajo dice
+     a qué eventos se aplica.
    - **Fotos por evento**: en la pestaña Eventos, a cada evento le puedes elegir su categoría
      de fotos (motos, alquiler…). Si no eliges, usa la de cada publicación.
    - **Duplicar** (en Publicaciones) hace una copia en pausa para crear variantes. Si borras

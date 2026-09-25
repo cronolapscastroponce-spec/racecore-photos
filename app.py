@@ -9,6 +9,7 @@ panel lee de Racecore por la red local (o que se crean a mano).
 Arranque: doble clic en 2_probar.bat  (o: .venv\\Scripts\\python app.py --abrir)
 Panel:    http://localhost:5000
 """
+import json
 import logging
 import os
 import random
@@ -261,8 +262,8 @@ def cuando_txt(occ):
 def resumen_programacion(pub):
     if pub["modo"] == "evento":
         extra = [CONDICIONES[pub["condicion"]].lower()] if pub["condicion"] in CONDICIONES and pub["condicion"] else []
-        if pub["filtro"]:
-            extra.append(f"solo «{pub['filtro']}»")
+        if resumen_filtro(pub["filtro"]):
+            extra.append(f"solo {resumen_filtro(pub['filtro'])}")
         return " · ".join([f"Eventos: {cuando_evento(pub)}", pub["hora"], *extra])
     if pub["modo"] == "fecha":
         try:
@@ -514,11 +515,43 @@ def cuando_evento(pub):
     return f"{cada}, {rango} días {lado}"
 
 
+def leer_filtro(texto):
+    """Filtro de eventos guardado -> {"campeonatos": [...], "eventos": [...], "texto": "..."}.
+
+    Se guarda en JSON. Antes era solo un texto: se sigue entendiendo como «que contengan».
+    """
+    filtro = {"campeonatos": [], "eventos": [], "texto": ""}
+    texto = (texto or "").strip()
+    try:
+        datos = json.loads(texto) if texto else {}
+    except ValueError:
+        datos = None
+    if not isinstance(datos, dict):
+        return filtro | {"texto": texto}
+    for clave in ("campeonatos", "eventos"):
+        filtro[clave] = [txt(x) for x in (datos.get(clave) or []) if txt(x)]
+    filtro["texto"] = txt(datos.get("texto"))
+    return filtro
+
+
+def resumen_filtro(texto):
+    f = leer_filtro(texto)
+    return ", ".join(f["campeonatos"] + f["eventos"] + ([f"«{f['texto']}»"] if f["texto"] else []))
+
+
 def eventos_de(pub, eventos=None):
-    """Eventos a los que se aplica la publicación: todos, o los que contienen el filtro."""
+    """Eventos a los que se aplica la publicación: todos, o los de los campeonatos y eventos
+    marcados, o los que contienen el texto del filtro."""
     eventos = consulta("SELECT * FROM eventos") if eventos is None else eventos
-    filtro = (pub["filtro"] or "").strip().casefold()
-    return [e for e in eventos if not filtro or filtro in f"{e['nombre']} {e['campeonato']}".casefold()]
+    f = leer_filtro(pub["filtro"])
+    if not (f["campeonatos"] or f["eventos"] or f["texto"]):
+        return list(eventos)
+    campeonatos = {c.casefold() for c in f["campeonatos"]}
+    nombres = {n.casefold() for n in f["eventos"]}
+    texto = f["texto"].casefold()
+    return [e for e in eventos
+            if e["campeonato"].casefold() in campeonatos or e["nombre"].casefold() in nombres
+            or (texto and texto in f"{e['nombre']} {e['campeonato']}".casefold())]
 
 
 def ocurrencias_evento(pub, desde, hasta, eventos=None):
@@ -1481,6 +1514,14 @@ def publicaciones():
     return render_template("publicaciones.html", filas=filas)
 
 
+def guardar_filtro(f):
+    """Campeonatos y eventos marcados, y el texto, en JSON (vacío = todos los eventos)."""
+    filtro = {"campeonatos": sorted({x.strip() for x in f.getlist("f_campeonato") if x.strip()}),
+              "eventos": sorted({x.strip() for x in f.getlist("f_evento") if x.strip()}),
+              "texto": f.get("f_texto", "").strip()}
+    return json.dumps(filtro, ensure_ascii=False) if any(filtro.values()) else ""
+
+
 def leer_formulario():
     f = request.form
     errores = []
@@ -1530,7 +1571,7 @@ def leer_formulario():
         "dias_desde": entero("dias_desde", 14, 0, 365),
         "dias_hasta": entero("dias_hasta", 3, 0, 365),
         "cada": entero("cada", 1, 1, 60),
-        "filtro": f.get("filtro", "").strip(),
+        "filtro": guardar_filtro(f),
         "condicion": f.get("condicion") if f.get("condicion") in CONDICIONES else "",
     }
     if datos["modo"] == "semanal" and not dias:
@@ -1568,13 +1609,17 @@ def editar_publicacion(pub_id=None):
                 return generar_ahora(pub_id)
             flash("Guardada.", "ok")
             return redirect(url_for("publicaciones"))
-    eventos_filtro = consulta("SELECT nombre, campeonato FROM eventos ORDER BY fecha, nombre")
-    sugerencias = sorted({e["campeonato"] for e in eventos_filtro if e["campeonato"]}) + \
-        sorted({e["nombre"] for e in eventos_filtro if e["nombre"]} - {e["campeonato"] for e in eventos_filtro})
+    # Para marcar: los campeonatos y los eventos de ahora (sin los ya pasados), más los ya marcados
+    filtro = leer_filtro(pub["filtro"])
+    todos = consulta("SELECT nombre, campeonato, fecha FROM eventos ORDER BY fecha, nombre")
+    desde = date.today() - timedelta(days=10)
+    campeonatos = sorted({e["campeonato"] for e in todos if e["campeonato"]} | set(filtro["campeonatos"]),
+                         key=str.casefold)
+    sueltos = list(dict.fromkeys([e["nombre"] for e in todos if e["nombre"] and
+                                  (leer_fecha(e["fecha"]) or desde) >= desde] + filtro["eventos"]))
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
-                           sugerencias=sugerencias,
-                           eventos_filtro=[{"n": e["nombre"], "t": f"{e['nombre']} {e['campeonato']}"}
-                                           for e in eventos_filtro],
+                           filtro=filtro, campeonatos=campeonatos, sueltos=sueltos,
+                           eventos_filtro=[{"n": e["nombre"], "c": e["campeonato"]} for e in todos],
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
                            dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")),
                            estilos=ia_fondo.ESTILOS, momentos=MOMENTOS, condiciones=CONDICIONES)
@@ -2229,12 +2274,14 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
       </div>
       <div class="ayuda">Ej.: antes, de 14 a 3, cada 2 → se publica a 14, 12, 10, 8, 6 y 4 días del evento. Para un solo día pon el mismo número: de 10 a 10. Al día siguiente: después, de 1 a 1.</div>
     </div>
-    <label>Solo para estos eventos (opcional)</label>
-    <input type="text" name="filtro" list="lista_eventos" value="{{ pub.filtro }}" autocomplete="off"
-           placeholder="Vacío = todos los eventos. Pulsa aquí para elegir un campeonato o un evento">
-    <datalist id="lista_eventos">{% for x in sugerencias %}<option value="{{ x }}">{% endfor %}</datalist>
-    <div class="ayuda">Si eliges un campeonato, vale para todas sus carreras, también las que se creen más adelante. También puedes escribir solo una parte del nombre.</div>
-    <div class="aviso" id="aplica" hidden></div>
+    <label>¿Para qué eventos? <span class="ayuda">Si no marcas nada, para todos.</span></label>
+    {% if campeonatos %}<div class="ayuda">Campeonatos (también sus carreras futuras):</div>
+    <div class="opciones">{% for c in campeonatos %}<label><input type="checkbox" name="f_campeonato" value="{{ c }}" {{ 'checked' if c in filtro.campeonatos }}> {{ c }}</label>{% endfor %}</div>{% endif %}
+    {% if sueltos %}<div class="ayuda" style="margin-top:8px">Eventos sueltos:</div>
+    <div class="opciones">{% for n in sueltos %}<label><input type="checkbox" name="f_evento" value="{{ n }}" {{ 'checked' if n in filtro.eventos }}> {{ n }}</label>{% endfor %}</div>{% endif %}
+    <label>O los que contengan este texto (opcional)</label>
+    <input type="text" name="f_texto" value="{{ filtro.texto }}" placeholder="Ej: MOTO" autocomplete="off">
+    <div class="aviso" id="aplica"></div>
   </div>
   <div class="dos">
     <div><label>Hora de publicación</label><input type="time" name="hora" value="{{ pub.hora }}" required></div>
@@ -2314,16 +2361,20 @@ function mostrarModo() {
   document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
 }
 document.querySelectorAll('input[name=modo], select[name=momento]').forEach(r => r.addEventListener('change', mostrarModo));
-// A qué eventos de ahora se aplica el filtro (igual que en el servidor: el texto está en el nombre o el campeonato)
+// A qué eventos de ahora se aplica (igual que eventos_de() en el servidor)
 const EVENTOS = {{ eventos_filtro|tojson }};
 function aplica() {
-  const f = document.querySelector('input[name=filtro]').value.trim().toLowerCase();
+  const marcados = n => [...document.querySelectorAll(`input[name=${n}]:checked`)].map(x => x.value.toLowerCase());
+  const camp = marcados('f_campeonato'), evs = marcados('f_evento');
+  const t = document.querySelector('input[name=f_texto]').value.trim().toLowerCase();
   const caja = document.getElementById('aplica');
-  const si = EVENTOS.filter(e => e.t.toLowerCase().includes(f)).map(e => e.n);
-  caja.hidden = !f || !EVENTOS.length;
+  if (!camp.length && !evs.length && !t) { caja.textContent = 'Se aplica a todos los eventos.'; return; }
+  const si = EVENTOS.filter(e => camp.includes(e.c.toLowerCase()) || evs.includes(e.n.toLowerCase())
+                              || (t && (e.n + ' ' + e.c).toLowerCase().includes(t))).map(e => e.n);
   caja.textContent = si.length ? 'Ahora se aplica a: ' + si.join(', ') : 'Ahora no coincide con ningún evento.';
 }
-document.querySelector('input[name=filtro]').addEventListener('input', aplica);
+document.querySelectorAll('input[name=f_campeonato], input[name=f_evento], input[name=f_texto]')
+  .forEach(x => { x.addEventListener('change', aplica); x.addEventListener('input', aplica); });
 aplica();
 mostrarModo();
 </script>
