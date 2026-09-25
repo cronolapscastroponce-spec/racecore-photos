@@ -10,7 +10,8 @@ abrir puertos y arrancando solo con el PC.
 2. Doble clic en **`1_instalar.bat`**. Instala Python si hace falta y las librerías.
 3. Doble clic en **`2_probar.bat`**. Se abre el panel en el navegador
    (`http://localhost:5000`). Mientras esa ventana negra siga abierta, el panel funciona.
-4. En **Ajustes**: sube tu **logo** (PNG sin fondo) y pon tus **redes**.
+4. En **Ajustes**: sube tu **logo** y tu **banner de redes** (si tienen fondo negro, el panel se lo quita),
+   o escribe tus redes para que el panel las dibuje.
    - Fuentes propias (opcional): `Titulo.ttf` y `Texto.ttf` en la carpeta `fuentes`.
 
 ## Actualizar el panel

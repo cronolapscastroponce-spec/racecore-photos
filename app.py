@@ -35,6 +35,7 @@ DIR_MINIS = BASE / "miniaturas"
 DIR_GEN = BASE / "generadas"
 DIR_FUENTES = BASE / "fuentes"
 LOGO = BASE / "logo.png"
+BANNER = BASE / "banner_redes.png"
 PUERTO = int(os.environ.get("PUERTO", "5000"))
 
 FORMATOS = {
@@ -677,6 +678,20 @@ def redes_configuradas():
     return [(t, ajuste(f"red_{t}")) for t in REDES if ajuste(f"red_{t}")]
 
 
+def banner_redes(W, H):
+    """Banner de redes subido en Ajustes, escalado y colocado abajo: (imagen, x, y). None si no hay."""
+    if not BANNER.exists():
+        return None
+    with Image.open(BANNER) as b:
+        b = b.convert("RGBA")
+    ancho = int(W * 0.94)
+    b = b.resize((ancho, max(1, round(b.height * ancho / b.width))), Image.LANCZOS)
+    if b.height > H * 0.12:
+        b.thumbnail((ancho, int(H * 0.12)), Image.LANCZOS)
+    _, abajo = margenes(W, H)
+    return b, (W - b.width) // 2, abajo - b.height
+
+
 def superponer_cartel(img, pub, occ):
     W, H = img.size
     arriba, abajo = margenes(W, H)
@@ -685,6 +700,10 @@ def superponer_cartel(img, pub, occ):
     franja = variables(pub["subtitulo"], occ).upper()
     datos = variables(pub["pie"], occ).upper()
     redes = redes_configuradas()
+    banner = banner_redes(W, H)
+    if banner:  # el banner sustituye a las redes dibujadas y todo lo demás va encima
+        redes = []
+        abajo = banner[2] - int(W * 0.03)
 
     # Foto con más garra: algo más de contraste y color
     img = ImageEnhance.Contrast(ImageEnhance.Color(img).enhance(1.15)).enhance(1.08)
@@ -701,8 +720,10 @@ def superponer_cartel(img, pub, occ):
         if arriba + alto_arriba + H * 0.1 <= abajo - alto_abajo:
             break
 
-    oscurecer_cartel(img, arriba + alto_arriba + int(H * 0.12) if de_arriba else 0,
-                     abajo - alto_abajo - int(H * 0.15) if de_abajo else H)
+    inicio_abajo = abajo - alto_abajo - int(H * 0.15) if de_abajo else H
+    if banner:
+        inicio_abajo = min(inicio_abajo, banner[2] - int(H * 0.08))
+    oscurecer_cartel(img, arriba + alto_arriba + int(H * 0.12) if de_arriba else 0, inicio_abajo)
     y = arriba
     for alto, dibujar in de_arriba:
         dibujar(img, y)
@@ -711,6 +732,8 @@ def superponer_cartel(img, pub, occ):
     for alto, dibujar in de_abajo:
         dibujar(img, y)
         y += alto + hueco
+    if banner:
+        img.paste(banner[0], banner[1:], banner[0])
     return img
 
 
@@ -718,8 +741,12 @@ def superponer_marca(img):
     """Diseño «IA completa»: los textos ya los puso la IA; aquí solo logo y redes, siempre iguales."""
     W, H = img.size
     arriba, abajo = margenes(W, H)
-    redes = bloque_redes(redes_configuradas(), W, 1.0)
-    if redes:
+    banner = banner_redes(W, H)
+    redes = None if banner else bloque_redes(redes_configuradas(), W, 1.0)
+    if banner:
+        oscurecer_cartel(img, 0, banner[2] - int(H * 0.06), vineta=False)
+        img.paste(banner[0], banner[1:], banner[0])
+    elif redes:
         alto, dibujar = redes
         oscurecer_cartel(img, 0, abajo - alto - int(H * 0.06), vineta=False)
         dibujar(img, abajo - alto)
@@ -733,9 +760,13 @@ def prompt_ia_cartel(pub, occ, W, H):
     """Prompt para «IA completa», con los huecos exactos que luego ocupan el logo y las redes."""
     arriba, abajo = margenes(W, H)
     lg = logo_ajustado(W, H, 1.0)
+    banner = banner_redes(W, H)
     redes = bloque_redes(redes_configuradas(), W, 1.0)
     zona_logo = (round((W * 0.05 + lg.width) / W * 100) + 4, round((arriba + lg.height) / H * 100) + 3) if lg else None
-    zona_redes = round((H - abajo + redes[0]) / H * 100) + 3 if redes else None
+    if banner:
+        zona_redes = round((H - banner[2]) / H * 100) + 3
+    else:
+        zona_redes = round((H - abajo + redes[0]) / H * 100) + 3 if redes else None
     lineas = lambda texto: [l.strip() for l in variables(texto, occ).upper().split("\n") if l.strip()]  # noqa: E731
     datos = [x.strip() for x in variables(pub["pie"], occ).upper().split("|") if x.strip()]
     return ia_fondo.prompt_cartel(lineas(pub["titulo"]), lineas(pub["subtitulo"]), datos, pub["color"],
@@ -1233,39 +1264,64 @@ def ajustes():
         "ajustes.html", openai_key=oculta("openai_key"), telegram_token=oculta("telegram_token"),
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
         ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
-        logo_v=int(LOGO.stat().st_mtime) if LOGO.exists() else 0, redes={r: ajuste(f"red_{r}") for r in REDES},
+        marcas_v={t: int(r.stat().st_mtime) if r.exists() else 0 for t, (r, _) in MARCAS.items()},
+        redes={r: ajuste(f"red_{r}") for r in REDES},
         fuentes=[n for n in ("Titulo.ttf", "Texto.ttf") if (DIR_FUENTES / n).exists()])
 
 
-@app.route("/logo.png")
-def ver_logo():
-    if not LOGO.exists():
+MARCAS = {"logo": (LOGO, "Logo"), "banner": (BANNER, "Banner de redes")}
+
+
+def quitar_fondo_negro(im):
+    """Si la imagen no tiene transparencia y su fondo es negro, el negro pasa a ser transparente."""
+    if im.getchannel("A").getextrema()[0] < 250:
+        return im, False
+    rgb = im.convert("RGB")
+    esquinas = [rgb.getpixel((x, y)) for x in (0, rgb.width - 1) for y in (0, rgb.height - 1)]
+    if max(max(c) for c in esquinas) > 40:
+        return im, False
+    r, g, b = rgb.split()
+    brillo = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    rgb.putalpha(brillo.point(lambda v: 0 if v < 25 else min(255, (v - 25) * 3)))
+    return rgb, True
+
+
+@app.route("/marca/<tipo>.png")
+def ver_marca(tipo):
+    if tipo not in MARCAS or not MARCAS[tipo][0].exists():
         abort(404)
-    return send_from_directory(BASE, LOGO.name, max_age=0)
+    return send_from_directory(BASE, MARCAS[tipo][0].name, max_age=0)
 
 
-@app.post("/ajustes/logo")
-def subir_logo():
+@app.post("/ajustes/marca/<tipo>")
+def subir_marca(tipo):
+    if tipo not in MARCAS:
+        abort(404)
+    destino, nombre = MARCAS[tipo]
     if request.form.get("quitar"):
-        LOGO.unlink(missing_ok=True)
-        flash("Logo quitado.", "ok")
+        destino.unlink(missing_ok=True)
+        flash(f"{nombre}: quitado.", "ok")
         return redirect(url_for("ajustes"))
-    f = request.files.get("logo")
     try:
-        with Image.open(f.stream) as im:
+        with Image.open(request.files["archivo"].stream) as im:
             im = ImageOps.exif_transpose(im).convert("RGBA")
+        im, sin_negro = quitar_fondo_negro(im)
         transparente = im.getchannel("A").getextrema()[0] < 250
-        caja = im.getchannel("A").getbbox()  # recorta los bordes transparentes
+        caja = im.getchannel("A").getbbox()  # recorta los bordes vacíos
         if caja:
             im = im.crop(caja)
-        im.thumbnail((1600, 1600), Image.LANCZOS)
-        im.save(LOGO, "PNG")
+        im.thumbnail((2000, 2000), Image.LANCZOS)
+        im.save(destino, "PNG")
     except Exception:
         flash("Ese archivo no es una imagen válida.", "error")
         return redirect(url_for("ajustes"))
-    flash("Logo guardado." if transparente else
-          "Logo guardado, pero no tiene fondo transparente: se verá como un recuadro. Mejor un PNG sin fondo.",
-          "ok" if transparente else "error")
+    if sin_negro:
+        flash(f"{nombre}: guardado (le he quitado el fondo negro).", "ok")
+    elif transparente:
+        flash(f"{nombre}: guardado.", "ok")
+    else:
+        flash(f"{nombre}: guardado, pero no tiene fondo transparente y se verá como un recuadro. "
+              "Mejor un PNG sin fondo.", "error")
     return redirect(url_for("ajustes"))
 
 
@@ -1615,21 +1671,25 @@ document.getElementById('subida').addEventListener('submit', async (ev) => {
 PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 {% block contenido %}
 <h1>Ajustes</h1>
-<form class="caja" method="post" enctype="multipart/form-data" action="{{ url_for('subir_logo') }}">
-  <b>Logo</b>
-  <div class="ayuda">Sale en todas las imágenes. Mejor un PNG con fondo transparente.</div>
-  {% if logo_v %}<div style="background:#555; display:inline-block; padding:10px; border-radius:8px; margin:10px 0">
-    <img src="{{ url_for('ver_logo', v=logo_v) }}" alt="" style="max-height:90px; max-width:260px; display:block"></div>{% endif %}
+{% for tipo, titulo, ayuda in [
+  ('logo', 'Logo', 'Sale arriba a la izquierda en todas las imágenes. Mejor PNG sin fondo; si tiene fondo negro, se lo quito.'),
+  ('banner', 'Banner de redes', 'Sale abajo en «Cartel» e «IA completa». Si lo subes, se usa en vez de los nombres de redes de más abajo. Si tiene fondo negro, se lo quito y recorto lo que sobra.')] %}
+<form class="caja" method="post" enctype="multipart/form-data" action="{{ url_for('subir_marca', tipo=tipo) }}">
+  <b>{{ titulo }}</b>
+  <div class="ayuda">{{ ayuda }}</div>
+  {% if marcas_v[tipo] %}<div style="background:#555; display:inline-block; padding:10px; border-radius:8px; margin:10px 0; max-width:100%">
+    <img src="{{ url_for('ver_marca', tipo=tipo, v=marcas_v[tipo]) }}" alt="" style="max-height:90px; max-width:100%; display:block"></div>{% endif %}
   <div class="fila" style="margin-top:8px">
-    <input type="file" name="logo" accept="image/png,image/jpeg,image/webp">
-    <button class="principal">Subir logo</button>
-    {% if logo_v %}<button name="quitar" value="1" class="peligro" formnovalidate>Quitar logo</button>{% endif %}
+    <input type="file" name="archivo" accept="image/png,image/jpeg,image/webp">
+    <button class="principal">Subir</button>
+    {% if marcas_v[tipo] %}<button name="quitar" value="1" class="peligro" formnovalidate>Quitar</button>{% endif %}
   </div>
 </form>
+{% endfor %}
 <form method="post">
 <div class="caja">
-  <b>Redes (salen abajo en el diseño «Cartel»)</b>
-  <div class="ayuda">Deja vacías las que no quieras que salgan.</div>
+  <b>Redes (si no has subido banner de redes)</b>
+  <div class="ayuda">Se dibujan abajo con sus iconos. Deja vacías las que no quieras que salgan.</div>
   <div class="dos">
     <div><label>Facebook</label><input type="text" name="red_facebook" value="{{ redes.facebook }}" placeholder="kartingcastroponce"></div>
     <div><label>Instagram</label><input type="text" name="red_instagram" value="{{ redes.instagram }}" placeholder="karting_castroponce"></div>
