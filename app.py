@@ -185,7 +185,9 @@ def ocurrencias(pub, desde, hasta):
 
 def proxima(pub, ahora=None):
     ahora = ahora or datetime.now()
-    occ = ocurrencias(pub, ahora, ahora + timedelta(days=8))
+    # una fecha concreta puede estar lejos; las semanales se repiten cada 7 días
+    hasta = datetime.max if pub["modo"] == "fecha" else ahora + timedelta(days=8)
+    occ = ocurrencias(pub, ahora, hasta)
     return occ[0] if occ else None
 
 
@@ -1513,8 +1515,8 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 <div class="caja">
   <b>¿Cuándo?</b>
   <div class="opciones">
-    <label><input type="radio" name="modo" value="semanal" {{ 'checked' if pub.modo != 'fecha' }} onchange="modo()"> Días de la semana</label>
-    <label><input type="radio" name="modo" value="fecha" {{ 'checked' if pub.modo == 'fecha' }} onchange="modo()"> Fecha concreta</label>
+    <label><input type="radio" name="modo" value="semanal" {{ 'checked' if pub.modo != 'fecha' }}> Días de la semana</label>
+    <label><input type="radio" name="modo" value="fecha" {{ 'checked' if pub.modo == 'fecha' }}> Fecha concreta</label>
   </div>
   <div id="semanal" class="dias">
     {% for d in dias %}<label><input type="checkbox" name="dias" value="{{ loop.index0 }}" {{ 'checked' if loop.index0|string in dias_marcados }}> {{ d }}</label>{% endfor %}
@@ -1577,12 +1579,14 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 </div>
 </form>
 <script>
-function modo() {
+// (no se puede llamar «modo»: dentro del formulario ese nombre es el de los botones de radio)
+function mostrarModo() {
   const fecha = document.querySelector('input[name=modo][value=fecha]').checked;
   document.getElementById('fecha').hidden = !fecha;
   document.getElementById('semanal').hidden = fecha;
 }
-modo();
+document.querySelectorAll('input[name=modo]').forEach(r => r.addEventListener('change', mostrarModo));
+mostrarModo();
 </script>
 {% endblock %}"""
 
