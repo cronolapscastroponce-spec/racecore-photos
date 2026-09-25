@@ -1808,6 +1808,7 @@ def eventos():
             "orden": (0, f.toordinal()) if f and f >= hoy else ((1, -f.toordinal()) if f else (2, 0)),
             "cuando": f"{DIAS[f.weekday()]} {f:%d/%m/%Y}" + (f" · {ev['hora']}" if ev["hora"] else "") if f else "",
             "pasado": bool(f and f < hoy), "inscritos_txt": inscritos,
+            "n_nombres": sum(1 for l in ev["pilotos"].splitlines() if l.strip() and not l.strip().endswith(":")),
             "proximas": [(cuando_txt(o), n, c) for o, n, c in proximas[:8]],
         })
     filas.sort(key=lambda e: e["orden"])
@@ -2689,7 +2690,7 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
       {% if ev.pasado %}<span class="chip">ya pasó</span>{% endif %}
       {% if ev.cuando %}<div class="ayuda">{{ ev.cuando }}{% if ev.campeonato %} · {{ ev.campeonato }}{% endif %}</div>
       {% else %}<div class="aviso">{% if ev.fecha_txt %}No entiendo la fecha «{{ ev.fecha_txt }}»{% else %}No tiene fecha{% endif %}: para este evento no se programa nada.</div>{% endif %}
-      <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
+      <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Nombres: {{ ev.n_nombres if ev.n_nombres else ('no llegan de Racecore' if ev.origen == 'racecore' else '—') }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
       <form method="post" action="{{ url_for('fotos_evento', ev_id=ev.id) }}" class="fila" style="margin-top:6px">
         <span class="ayuda">Fotos:</span>
         <select name="categoria_id" onchange="this.form.submit()" style="width:auto">
@@ -2711,6 +2712,9 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
   <details style="margin-top:8px"><summary class="ayuda" style="cursor:pointer">Ver datos</summary>
     <div class="ayuda" style="white-space:pre-line; margin-top:6px">{% if ev.enlace %}Inscripción: {{ ev.enlace }}
 {% endif %}{% if ev.web %}Web: {{ ev.web }}
+{% endif %}{% if ev.pilotos %}
+Nombres para redes:
+{{ ev.pilotos }}
 {% endif %}{% if ev.horarios %}
 Horarios:
 {{ ev.horarios }}
