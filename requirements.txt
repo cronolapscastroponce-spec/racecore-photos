@@ -1,0 +1,5 @@
+flask>=3.0
+pillow>=10.1
+waitress>=3.0
+requests>=2.31
+openai>=1.99

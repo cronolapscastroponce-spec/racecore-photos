@@ -1,0 +1,7 @@
+Opcional: pon aqui tus fuentes con estos nombres exactos:
+
+  Titulo.ttf  -> para el titulo
+  Texto.ttf   -> para el subtitulo y el pie
+
+Si no hay ninguna, el panel usa las de Windows (Arial Black y Arial).
+El logo va en la carpeta principal del panel, con el nombre logo.png

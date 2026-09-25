@@ -1,5 +1,4 @@
-# Para el panel y quita la tarea programada. Ejecutar como administrador:
-#   powershell -ExecutionPolicy Bypass -File windows\desinstalar_servicio.ps1
+# Para el panel y quita la tarea programada. Se lanza con quitar_arranque_automatico.bat
 param([switch]$Silencioso)
 $nombre = "Racecore Redes"
 
