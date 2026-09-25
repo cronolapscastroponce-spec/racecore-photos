@@ -14,9 +14,13 @@ abrir puertos y arrancando solo con el PC.
    - Logo: `logo.png` en `C:\racecore-redes`.
    - Fuentes: `Titulo.ttf` y `Texto.ttf` en la carpeta `fuentes`.
 
+## Actualizar el panel
+
+Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, publicaciones ni ajustes.
+
 ## B. Usar el panel
 
-- **Fotos**: crea categorías y sube fotos.
+- **Fotos**: crea categorías y sube fotos. Puedes elegir cientos a la vez: se suben de una en una.
 - **Publicaciones**: días o fecha, hora, antelación, categoría, formato y textos.
   - Variables: `{dia}` (sábado), `{fecha}` (27 de septiembre) y `{hora}` (18:00).
   - **Prompt IA**: si lo dejas vacío, se usa la foto tal cual. Si escribes algo, la IA

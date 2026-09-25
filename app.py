@@ -47,6 +47,8 @@ DIAS_CORTOS = ["L", "M", "X", "J", "V", "S", "D"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
 EXTENSIONES = {".jpg", ".jpeg", ".png", ".webp"}
+LADO_MAX_FOTO = 3000                # las fotos se guardan como mucho a este tamaño (sobra para 1080 px)
+Image.MAX_IMAGE_PIXELS = 400_000_000  # fotos de móvil de 200 MP
 GRACIA = timedelta(minutes=10)      # margen si el PC estaba ocupado justo a la hora
 DIAS_CONSERVAR = 60                 # las imágenes generadas se borran pasado este tiempo
 
@@ -573,7 +575,7 @@ def borrar_generada(gen_id):
 # --- Publicaciones
 
 NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "fecha": "",
-         "hora": "18:00", "antelacion": 60, "categoria_id": None, "formato": "post",
+         "hora": "18:00", "antelacion": 1440, "categoria_id": None, "formato": "post",
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e10600", "prompt_ia": ""}
 
 
@@ -730,11 +732,32 @@ def categoria_o_404(cat_id):
 def categoria(cat_id):
     cat = categoria_o_404(cat_id)
     lista = consulta("SELECT * FROM fotos WHERE categoria_id = ? ORDER BY id DESC", (cat_id,))
-    return render_template("categoria.html", cat=cat, fotos=lista)
+    return render_template("categoria.html", cat=cat, fotos=lista,
+                           subidas=request.args.get("subidas", type=int), malas=request.args.get("malas", type=int))
 
 
 def miniatura(archivo):
     return Path(archivo).stem + ".jpg"
+
+
+def guardar_foto(cat_id, f):
+    """Guarda la foto ya girada y reducida, y su miniatura. False si no es una imagen válida."""
+    if Path(f.filename or "").suffix.lower() not in EXTENSIONES:
+        return False
+    archivo = f"{uuid.uuid4().hex}.jpg"
+    try:
+        with Image.open(f.stream) as im:
+            im.draft("RGB", (LADO_MAX_FOTO, LADO_MAX_FOTO))  # JPEG grandes: decodifica ya reducido
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            im.thumbnail((LADO_MAX_FOTO, LADO_MAX_FOTO), Image.LANCZOS)
+            im.save(DIR_FOTOS / archivo, "JPEG", quality=90)
+            im.thumbnail((480, 480))
+            im.save(DIR_MINIS / miniatura(archivo), "JPEG", quality=85)
+    except Exception:
+        (DIR_FOTOS / archivo).unlink(missing_ok=True)
+        return False
+    ejecutar("INSERT INTO fotos (categoria_id, archivo, subida) VALUES (?, ?, ?)", (cat_id, archivo, ahora_txt()))
+    return True
 
 
 @app.post("/categorias/<int:cat_id>/subir")
@@ -742,25 +765,12 @@ def subir_fotos(cat_id):
     categoria_o_404(cat_id)
     subidas = malas = 0
     for f in request.files.getlist("fotos"):
-        ext = Path(f.filename or "").suffix.lower()
-        if ext not in EXTENSIONES:
+        if guardar_foto(cat_id, f):
+            subidas += 1
+        else:
             malas += 1
-            continue
-        archivo = f"{uuid.uuid4().hex}{ext}"
-        destino = DIR_FOTOS / archivo
-        f.save(destino)
-        try:
-            with Image.open(destino) as im:
-                im = ImageOps.exif_transpose(im).convert("RGB")
-                im.thumbnail((480, 480))
-                im.save(DIR_MINIS / miniatura(archivo), "JPEG", quality=85)
-        except Exception:
-            destino.unlink(missing_ok=True)
-            malas += 1
-            continue
-        ejecutar("INSERT INTO fotos (categoria_id, archivo, subida) VALUES (?, ?, ?)",
-                 (cat_id, archivo, ahora_txt()))
-        subidas += 1
+    if request.headers.get("X-Subida") == "1":  # subida de una en una desde la página
+        return {"subidas": subidas, "malas": malas}
     if subidas:
         flash(f"{subidas} foto(s) subida(s).", "ok")
     if malas:
@@ -905,7 +915,7 @@ PLANTILLAS["listas.html"] = """{% extends "base.html" %}
 {% for g in filas %}
 <div class="caja tarjeta">
   <div>
-    {% if g.estado == 'lista' %}<a href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" target="_blank"><img src="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" alt=""></a>
+    {% if g.estado == 'lista' %}<a href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" target="_blank"><img loading="lazy" src="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" alt=""></a>
     {% elif g.estado == 'generando' %}<div class="hueco">Generando…</div>
     {% else %}<div class="hueco">No se pudo generar</div>{% endif %}
   </div>
@@ -937,7 +947,7 @@ PLANTILLAS["listas.html"] = """{% extends "base.html" %}
 {% if hechas %}
 <h2>Publicadas hace poco</h2>
 <div class="rejilla">
-{% for g in hechas %}<a href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" target="_blank" title="{{ g.nombre }} · {{ g.cuando }}"><img src="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" alt=""></a>{% endfor %}
+{% for g in hechas %}<a href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" target="_blank" title="{{ g.nombre }} · {{ g.cuando }}"><img loading="lazy" src="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}" alt=""></a>{% endfor %}
 </div>
 {% endif %}
 
@@ -1023,6 +1033,7 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
     <div><label>Hora de publicación</label><input type="time" name="hora" value="{{ pub.hora }}" required></div>
     <div><label>Preparar la imagen con antelación (minutos)</label><input type="number" name="antelacion" min="0" max="10080" value="{{ pub.antelacion }}"></div>
   </div>
+  <div class="ayuda">1440 = un día antes. La imagen se prepara en cuanto el PC esté encendido dentro de ese margen.</div>
 </div>
 
 <div class="caja">
@@ -1079,7 +1090,7 @@ PLANTILLAS["fotos.html"] = """{% extends "base.html" %}
 <div class="rejilla">
 {% for c in cats %}
 <a href="{{ url_for('categoria', cat_id=c.id) }}" style="text-decoration:none">
-  {% if c.portada %}<img src="{{ url_for('archivo', carpeta='miniaturas', nombre=c.portada.rsplit('.', 1)[0] ~ '.jpg') }}" alt="">
+  {% if c.portada %}<img loading="lazy" src="{{ url_for('archivo', carpeta='miniaturas', nombre=c.portada.rsplit('.', 1)[0] ~ '.jpg') }}" alt="">
   {% else %}<div class="vacio" style="aspect-ratio:1; padding:0; display:flex; align-items:center; justify-content:center">vacía</div>{% endif %}
   <div style="margin-top:6px"><b>{{ c.nombre }}</b> <span class="ayuda">{{ c.total }} foto(s)</span></div>
 </a>
@@ -1093,18 +1104,53 @@ PLANTILLAS["categoria.html"] = """{% extends "base.html" %}
 {% block contenido %}
 <p><a href="{{ url_for('fotos') }}">← Todas las categorías</a></p>
 <h1>{{ cat.nombre }} <span class="ayuda">{{ fotos|length }} foto(s)</span></h1>
-<form class="caja" method="post" enctype="multipart/form-data" action="{{ url_for('subir_fotos', cat_id=cat.id) }}">
+{% if subidas %}<div class="mensaje">{{ subidas }} foto(s) subida(s).</div>{% endif %}
+{% if malas %}<div class="mensaje error">{{ malas }} archivo(s) no se pudieron subir: usa fotos JPG, PNG o WEBP.</div>{% endif %}
+<form class="caja" id="subida" method="post" enctype="multipart/form-data" action="{{ url_for('subir_fotos', cat_id=cat.id) }}">
   <b>Subir fotos</b>
-  <div class="ayuda">Puedes elegir varias a la vez.</div>
+  <div class="ayuda">Puedes elegir muchas a la vez: se suben de una en una.</div>
   <div class="fila" style="margin-top:10px">
     <input type="file" name="fotos" accept="image/jpeg,image/png,image/webp" multiple required>
     <button class="principal">Subir</button>
   </div>
+  <div id="progreso" class="aviso" hidden></div>
 </form>
+<script>
+document.getElementById('subida').addEventListener('submit', async (ev) => {
+  const form = ev.target;
+  const archivos = [...form.querySelector('input[type=file]').files];
+  if (!archivos.length || !window.fetch) return;
+  ev.preventDefault();
+  const progreso = document.getElementById('progreso');
+  form.querySelector('button').disabled = true;
+  progreso.hidden = false;
+  window.onbeforeunload = () => true;
+  let hechas = 0, subidas = 0, malas = 0;
+  const pintar = () => progreso.textContent = `Subiendo ${hechas} de ${archivos.length}… no cierres esta página.`
+    + (malas ? ` (${malas} con error)` : '');
+  pintar();
+  const cola = archivos.slice();
+  async function subir() {
+    while (cola.length) {
+      const datos = new FormData();
+      datos.append('fotos', cola.shift());
+      try {
+        const r = await fetch(form.action, { method: 'POST', body: datos, headers: { 'X-Subida': '1' } });
+        const j = await r.json();
+        subidas += j.subidas; malas += j.malas;
+      } catch (e) { malas++; }
+      hechas++; pintar();
+    }
+  }
+  await Promise.all([subir(), subir(), subir()]);
+  window.onbeforeunload = null;
+  location.href = location.pathname + '?subidas=' + subidas + '&malas=' + malas;
+});
+</script>
 <div class="rejilla">
 {% for f in fotos %}
 <div>
-  <a href="{{ url_for('archivo', carpeta='fotos', nombre=f.archivo) }}" target="_blank"><img src="{{ url_for('archivo', carpeta='miniaturas', nombre=f.archivo.rsplit('.', 1)[0] ~ '.jpg') }}" alt=""></a>
+  <a href="{{ url_for('archivo', carpeta='fotos', nombre=f.archivo) }}" target="_blank"><img loading="lazy" src="{{ url_for('archivo', carpeta='miniaturas', nombre=f.archivo.rsplit('.', 1)[0] ~ '.jpg') }}" alt=""></a>
   <form method="post" action="{{ url_for('borrar_foto', foto_id=f.id) }}" onsubmit="return confirm('¿Borrar esta foto?')" style="margin-top:4px"><button class="peligro" style="width:100%">Borrar</button></form>
 </div>
 {% else %}
