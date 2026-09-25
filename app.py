@@ -1233,6 +1233,28 @@ def componer(pub, occ, evitar=None, evitar_estilo=None):
 
 # ---------------------------------------------------------------- generación y programador
 
+def versiones(texto):
+    """«A\n---\nB» -> ["A", "B"]: versiones separadas por una línea con tres guiones (o más)."""
+    partes = [v.strip() for v in re.split(r"^[ \t]*-{3,}[ \t\r]*$", texto or "", flags=re.M)]
+    return [v for v in partes if v] or [""]
+
+
+def con_version(pub, fila):
+    """Con varias versiones en los textos, la que toca: se van turnando (1ª, 2ª, 3ª, 1ª...).
+
+    Cuenta las imágenes anteriores de la misma publicación (y del mismo evento). Las pruebas
+    no cuentan para las programadas; «Otra foto» mantiene la versión.
+    """
+    n = consulta("SELECT COUNT(*) AS n FROM generadas WHERE publicacion_id = ? AND evento_id = ? AND id < ?"
+                 + ("" if fila["prueba"] else " AND prueba = 0"),
+                 (pub["id"], fila["evento_id"], fila["id"]))[0]["n"]
+    datos = dict(pub)
+    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia"):
+        opciones = versiones(datos[campo])
+        datos[campo] = opciones[n % len(opciones)]
+    return datos
+
+
 def reclamar(pub_id, occ, prueba, evento_id=0):
     """Crea la fila «generando». Devuelve su id, o None si esa hora ya estaba generada."""
     cur = ejecutar("INSERT OR IGNORE INTO generadas (publicacion_id, evento_id, ocurrencia, prueba, creada) "
@@ -1243,7 +1265,9 @@ def reclamar(pub_id, occ, prueba, evento_id=0):
 
 def generar(gen_id, pub, occ, enviar=False):
     try:
-        anterior = consulta("SELECT archivo, foto_id, estilo FROM generadas WHERE id = ?", (gen_id,))
+        anterior = consulta("SELECT * FROM generadas WHERE id = ?", (gen_id,))
+        if anterior:
+            pub = con_version(pub, anterior[0])
         img, foto_id, con_ia, aviso, estilo = componer(pub, occ, anterior[0]["foto_id"] if anterior else None,
                                                       (anterior[0]["estilo"] or None) if anterior else None)
         archivo = f"{pub['id']}_{occ:%Y%m%d_%H%M}_{gen_id}_{uuid.uuid4().hex[:6]}.jpg"
@@ -2221,6 +2245,7 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <b>Texto del post</b>
   <textarea name="texto" style="min-height:140px" placeholder="El texto que pegarás en Instagram/Facebook">{{ pub.texto }}</textarea>
   <div class="ayuda" id="vars_normal">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00).</div>
+  <div class="ayuda"><b>Varias versiones:</b> escríbelas en la misma casilla separadas por una línea con <b>---</b> (tres guiones) y el panel las va turnando: la 1ª, luego la 2ª, la 3ª… Vale en Título, Franja y Texto del post, y van juntas: la 2ª versión del título sale con la 2ª del texto. «Generar ahora» pasa cada vez a la siguiente, para que las veas todas.</div>
   <div class="ayuda" id="vars_evento">En título, subtítulo, pie y texto puedes usar los datos del evento:
     {evento}, {campeonato}, {dia} {fecha} y {hora} (del evento), {dias} (los que faltan), {faltan} («en 5 días», «mañana», «hoy»),
     {inscritos}, {plazas}, {libres}, {precio}, {enlace} (inscripción), {web}, {horarios}, {resultados} y {ganadores} (para el pie del Cartel).</div>
