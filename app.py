@@ -2448,7 +2448,7 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
       <span class="chip">{{ 'a mano' if ev.origen == 'manual' else 'Racecore' }}</span>
       {% if ev.pasado %}<span class="chip">ya pasó</span>{% endif %}
       {% if ev.cuando %}<div class="ayuda">{{ ev.cuando }}{% if ev.campeonato %} · {{ ev.campeonato }}{% endif %}</div>
-      {% else %}<div class="aviso">No entiendo la fecha «{{ ev.fecha_txt }}»: para este evento no se programa nada.</div>{% endif %}
+      {% else %}<div class="aviso">{% if ev.fecha_txt %}No entiendo la fecha «{{ ev.fecha_txt }}»{% else %}No tiene fecha{% endif %}: para este evento no se programa nada.</div>{% endif %}
       <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
     </div>
     {% if ev.origen == 'manual' %}<div class="fila">
