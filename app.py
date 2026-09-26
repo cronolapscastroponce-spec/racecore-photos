@@ -1539,6 +1539,7 @@ def listas():
 
     return render_template("listas.html", filas=[preparar(g) for g in filas],
                            hechas=[preparar(g) for g in hechas],
+                           n_pruebas=sum(1 for g in filas if g["prueba"] and g["estado"] != "generando"),
                            generando=any(g["estado"] == "generando" for g in filas))
 
 
@@ -1573,6 +1574,18 @@ def otra_foto(gen_id):
         pub = con_evento(pub, ev[0], occ)
     ejecutar("UPDATE generadas SET estado = 'generando', aviso = '' WHERE id = ?", (gen_id,))
     en_segundo_plano(gen_id, pub, occ)
+    return redirect(url_for("listas"))
+
+
+@app.post("/generadas/borrar-pruebas")
+def borrar_pruebas():
+    """Quita de la lista todas las pruebas («Generar ahora») que ya estén hechas."""
+    pruebas = consulta("SELECT id, archivo FROM generadas WHERE prueba = 1 AND estado IN ('lista', 'error')")
+    for g in pruebas:
+        if g["archivo"]:
+            (DIR_GEN / g["archivo"]).unlink(missing_ok=True)
+        ejecutar("UPDATE generadas SET estado = 'descartada', archivo = NULL WHERE id = ?", (g["id"],))
+    flash(f"{len(pruebas)} prueba(s) borrada(s).", "ok")
     return redirect(url_for("listas"))
 
 
@@ -2237,7 +2250,9 @@ label { display:block; margin:14px 0 5px; color:var(--suave); font-size:13px; }
 PLANTILLAS["listas.html"] = """{% extends "base.html" %}
 {% block cabecera %}{% if generando %}<meta http-equiv="refresh" content="5">{% endif %}{% endblock %}
 {% block contenido %}
-<h1>Listas para publicar</h1>
+<div class="fila" style="justify-content:space-between"><h1>Listas para publicar</h1>
+{% if n_pruebas %}<form class="enlinea" method="post" action="{{ url_for('borrar_pruebas') }}" onsubmit="return confirm('¿Borrar las {{ n_pruebas }} pruebas?')"><button class="peligro">Borrar las pruebas ({{ n_pruebas }})</button></form>{% endif %}
+</div>
 <style>
 .tarjeta { display:grid; grid-template-columns:minmax(0, 320px) 1fr; gap:16px; }
 .tarjeta img { width:100%; border-radius:8px; display:block; }
