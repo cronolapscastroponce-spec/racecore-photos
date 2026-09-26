@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     momento TEXT NOT NULL DEFAULT 'antes', dias_desde INTEGER NOT NULL DEFAULT 14,
     dias_hasta INTEGER NOT NULL DEFAULT 3, cada INTEGER NOT NULL DEFAULT 2,
     filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '', lista TEXT NOT NULL DEFAULT '',
-    categorias_extra TEXT NOT NULL DEFAULT '', horario TEXT NOT NULL DEFAULT '', deportes TEXT NOT NULL DEFAULT '');
+    categorias_extra TEXT NOT NULL DEFAULT '', horario TEXT NOT NULL DEFAULT '', deportes TEXT NOT NULL DEFAULT '',
+    lista_ia TEXT NOT NULL DEFAULT 'panel');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
@@ -223,7 +224,8 @@ def iniciar():
                                     "lista": "TEXT NOT NULL DEFAULT ''",
                                     "categorias_extra": "TEXT NOT NULL DEFAULT ''",
                                     "horario": "TEXT NOT NULL DEFAULT ''",
-                                    "deportes": "TEXT NOT NULL DEFAULT ''"},
+                                    "deportes": "TEXT NOT NULL DEFAULT ''",
+                                    "lista_ia": "TEXT NOT NULL DEFAULT 'panel'"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0",
                                 "telegram": "TEXT NOT NULL DEFAULT ''"},
@@ -870,8 +872,8 @@ def con_horario(pub, occ):
     horario, nombres = calcular_horario(cfg, dias, consulta("SELECT * FROM eventos WHERE en_fuente = 1"))
     valores = {"{horario}": horario, "{dias_horario}": texto_dias(dias), "{eventos_horario}": unir(nombres)}
     datos = dict(pub)
-    if datos["diseno"] in ("cartel", "lista"):  # el horario siempre va en el centro del cartel
-        datos["diseno"] = "lista"
+    if datos["diseno"] in ("cartel", "lista", "ia"):  # el horario siempre va en el centro del cartel
+        datos["diseno"] = "ia" if datos["diseno"] == "ia" else "lista"
         if not datos["lista"].strip():
             datos["lista"] = "{horario}"
     for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
@@ -1087,8 +1089,8 @@ def con_deportes(pub, occ):
     dias = [occ.date() + timedelta(days=i) for i in range(cfg["dias"])]
     valores = {"{deportes}": texto_deportes(filas), "{dias_deportes}": texto_dias(dias)}
     datos = dict(pub)
-    if datos["diseno"] in ("cartel", "lista"):  # los horarios siempre van en el centro del cartel
-        datos["diseno"] = "lista"
+    if datos["diseno"] in ("cartel", "lista", "ia"):  # los horarios siempre van en el centro del cartel
+        datos["diseno"] = "ia" if datos["diseno"] == "ia" else "lista"
         if not datos["lista"].strip():
             datos["lista"] = "{deportes}"
     for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
@@ -1690,7 +1692,7 @@ def superponer_cartel(img, pub, occ):
     datos = variables(pub["pie"], occ).upper()
     # «Cartel con lista»: los nombres van en el centro, así que se deja más hueco
     lista = [l.strip() for l in variables(pub["lista"], occ).split("\n") if l.strip()] \
-        if pub["diseno"] == "lista" else []
+        if pub["diseno"] in ("lista", "ia") else []
     minimo = H * (0.45 if lista else 0.1)
     redes = redes_configuradas()
     banner = banner_redes(W, H)
@@ -1762,8 +1764,9 @@ def elegir_estilo(pub, evitar=None):
     return random.choice([e for e in ia_fondo.ESTILOS if e != evitar])
 
 
-def prompt_ia_cartel(pub, occ, W, H, estilo="marca"):
-    """Prompt para «IA completa», con los huecos exactos que luego ocupan el logo y las redes."""
+def prompt_ia_cartel(pub, occ, W, H, estilo="marca", lista=None, zona_lista=None):
+    """Prompt para «IA completa», con los huecos exactos que luego ocupan el logo, las redes y, si
+    la pone el panel, la lista del centro (horario, deportes...)."""
     arriba, abajo = margenes(W, H)
     lg = logo_ajustado(W, H, 1.0)
     banner = banner_redes(W, H)
@@ -1776,7 +1779,7 @@ def prompt_ia_cartel(pub, occ, W, H, estilo="marca"):
     lineas = lambda texto: [l.strip() for l in variables(texto, occ).upper().split("\n") if l.strip()]  # noqa: E731
     datos = [x.strip() for x in variables(pub["pie"], occ).upper().split("|") if x.strip()]
     return ia_fondo.prompt_cartel(lineas(pub["titulo"]), lineas(pub["subtitulo"]), datos, pub["color"],
-                                  pub["prompt_ia"], zona_logo, zona_redes, estilo)
+                                  pub["prompt_ia"], zona_logo, zona_redes, estilo, lista, zona_lista)
 
 
 def superponer(img, pub, occ):
@@ -1812,43 +1815,57 @@ def componer(pub, occ, evitar=None, evitar_estilo=None):
     fondo, con_ia = None, False
 
     deporte = pub["_fondo_deporte"] if "_fondo_deporte" in pub.keys() else ""
+    ruta = DIR_FOTOS / foto["archivo"] if foto else None
+    temporal = None
     if foto is None and deporte:
         fondo = fondo_deporte(deporte, ancho, alto)
+        if pub["diseno"] == "ia":  # la IA también puede partir del fondo genérico del deporte
+            temporal = ruta = DIR_GEN / f"tmp_{uuid.uuid4().hex}.jpg"
+            fondo.save(temporal, "JPEG", quality=92)
     elif foto is None:
         avisos.append("Las categorías elegidas no tienen fotos: se ha usado un fondo liso." if ids
                       else "No has elegido categoría de fotos: se ha usado un fondo liso.")
         fondo = fondo_liso(ancho, alto, pub["color"])
-    else:
-        ruta = DIR_FOTOS / foto["archivo"]
+    try:
         clave = ajuste("openai_key")
-        if pub["diseno"] == "ia":
+        if ruta is not None and pub["diseno"] == "ia":
             if not clave:
                 avisos.append("«IA completa» necesita la clave de OpenAI (Ajustes). Se ha usado el diseño Cartel.")
             else:
                 try:
                     estilo = elegir_estilo(pub, evitar_estilo)
+                    # Lista del centro (horario, deportes...): la pone el panel encima (exacta) o la IA
+                    lineas = [l.strip() for l in variables(pub["lista"] or "", occ).split("\n") if l.strip()]
+                    la_ia = bool(lineas) and "lista_ia" in pub.keys() and pub["lista_ia"] == "ia"
+                    zona = (30, 72) if lineas and not la_ia else None
                     with DIBUJO:
-                        prompt = prompt_ia_cartel(pub, occ, ancho, alto, estilo)
+                        prompt = prompt_ia_cartel(pub, occ, ancho, alto, estilo, lineas if la_ia else None, zona)
                     img = ia_fondo.generar_cartel(ruta, prompt, ancho, alto, clave,
                                                   calidad=ajuste("openai_calidad", "medium"))
                     with DIBUJO:
                         img = superponer_marca(img)
-                    return img, foto["id"], True, "", estilo
+                        if zona:
+                            pintar_lista(img, lineas, alto * zona[0] // 100, alto * zona[1] // 100,
+                                         color_rgb(pub["color"]))
+                    return img, (foto["id"] if foto else None), True, \
+                        "La IA ha escrito la lista: revisa bien cada hora antes de publicar." if la_ia else "", estilo
                 except Exception as e:  # la IA nunca debe dejar la publicación sin imagen
                     log.warning("IA: %s", e)
                     avisos.append(f"IA: ha fallado ({str(e)[:300]}). Se ha usado el diseño Cartel.")
-        elif pub["prompt_ia"].strip() and clave:  # sin clave de OpenAI la IA simplemente no se usa
-            if True:
-                try:
-                    fondo = ia_fondo.generar_fondo(ruta, pub["prompt_ia"], ancho, alto, clave,
-                                                   calidad=ajuste("openai_calidad", "medium"))
-                    con_ia = True
-                except Exception as e:  # la IA nunca debe dejar la publicación sin imagen
-                    log.warning("IA: %s", e)
-                    avisos.append(f"IA: ha fallado ({str(e)[:300]}). Se ha usado la foto original.")
+        elif foto is not None and pub["prompt_ia"].strip() and clave:  # sin clave, la IA no se usa
+            try:
+                fondo = ia_fondo.generar_fondo(ruta, pub["prompt_ia"], ancho, alto, clave,
+                                               calidad=ajuste("openai_calidad", "medium"))
+                con_ia = True
+            except Exception as e:  # la IA nunca debe dejar la publicación sin imagen
+                log.warning("IA: %s", e)
+                avisos.append(f"IA: ha fallado ({str(e)[:300]}). Se ha usado la foto original.")
         if fondo is None:
             with Image.open(ruta) as im:
                 fondo = ImageOps.fit(ImageOps.exif_transpose(im).convert("RGB"), (ancho, alto), Image.LANCZOS)
+    finally:
+        if temporal:
+            temporal.unlink(missing_ok=True)
 
     with DIBUJO:
         img = superponer(fondo, pub, occ)
@@ -2137,7 +2154,7 @@ NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
          "diseno": "cartel", "estilo_ia": "variado",
          "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": "",
-         "lista": "", "categorias_extra": "", "horario": "", "deportes": ""}
+         "lista": "", "categorias_extra": "", "horario": "", "deportes": "", "lista_ia": "panel"}
 DEPORTES_NUEVA = {"f1": False, "motogp": False, "futbol": False, "equipos": "Real Madrid, Barcelona",
                   "canal": "DAZN", "excluir": "Liga F", "dias": 4, "apertura": "10:00", "cierre": "20:00",
                   "foto_f1": "", "foto_motogp": "", "foto_futbol": ""}
@@ -2279,6 +2296,7 @@ def leer_formulario():
         "condicion": f.get("condicion") if f.get("condicion") in CONDICIONES else "",
         "categorias_extra": ",".join(sorted({x for x in f.getlist("categorias_extra") if x.isdigit()
                                              and x != str(categoria_id)}, key=int)),
+        "lista_ia": "ia" if f.get("lista_ia") == "ia" else "panel",
         "horario": guardar_horario(f) if tipo == "horario" else "",
         "deportes": guardar_deportes(f) if tipo == "deportes" else "",
     }
@@ -3381,6 +3399,13 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
       </select></div>
     <div><label>Color de acento</label><input type="color" name="color" value="{{ pub.color }}"></div>
   </div>
+  <div id="caja_lista_ia">
+    <label>Con «IA completa», el horario lo pone…</label>
+    <div class="opciones">
+      <label><input type="radio" name="lista_ia" value="panel" {{ 'checked' if pub.lista_ia != 'ia' }}> el panel encima (horas siempre exactas, recomendado)</label>
+      <label><input type="radio" name="lista_ia" value="ia" {{ 'checked' if pub.lista_ia == 'ia' }}> la IA (más integrado, pero puede equivocarse en alguna hora: revísalo)</label>
+    </div>
+  </div>
   <label>Formato</label>
   <select name="formato">{% for clave, f in formatos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.formato }}>{{ f[0] }}</option>{% endfor %}</select>
   <div id="caja_lista">
@@ -3446,6 +3471,7 @@ function mostrar() {
   $('d_futbol_campos').hidden = !$('d_futbol').checked;
   $('caja_lista').hidden = conLista || document.querySelector('select[name=diseno]').value !== 'lista';
   $('fotos_pub').hidden = tipo === 'deportes';
+  $('caja_lista_ia').hidden = !conLista || document.querySelector('select[name=diseno]').value !== 'ia';
   $('fotos_deportes').hidden = tipo !== 'deportes';
   $('vars_normal').hidden = tipo === 'evento';
   $('vars_evento').hidden = tipo !== 'evento';

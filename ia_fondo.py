@@ -77,12 +77,15 @@ def _comillas(texto):
     return "«" + texto.replace("*", "") + "»"
 
 
-def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes, estilo="marca"):
+def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes, estilo="marca",
+                  lista=None, zona_lista=None):
     """Instrucciones para que la IA haga el cartel con los textos exactos.
 
     titulo y franja: listas de líneas (lo que va entre *asteriscos* en color);
     datos: lista de textos cortos; zona_logo: (ancho %, alto %) libre arriba a la
-    izquierda o None; zona_redes: alto % libre abajo o None; estilo: clave de ESTILOS.
+    izquierda o None; zona_redes: alto % libre abajo o None; estilo: clave de ESTILOS;
+    lista: líneas de un horario que escribe la IA, o zona_lista: (desde %, hasta %) del
+    alto que se deja vacío en el centro porque el horario lo pone después app.py.
     """
     p = [
         "Convierte la foto adjunta en un cartel publicitario para redes sociales de un circuito de karting, "
@@ -107,7 +110,17 @@ def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes,
     if datos:
         p.append("- Datos, en letra más pequeña, cerca del mensaje destacado:")
         p += [f"    {_comillas(d)}" for d in datos]
+    if lista:
+        p.append("- Un horario en el centro, muy legible (lista o tabla limpia sobre un fondo que haga contraste), "
+                 "con estas líneas EXACTAS y en este orden. Copia cada hora dígito a dígito. Las que acaban en «:» "
+                 "son los días: van destacadas.")
+        p += [f"    {_comillas(l)}" for l in lista]
     p.append("")
+    if zona_lista:
+        p.append(f"- Deja VACÍA y oscura la zona central, entre el {zona_lista[0]} % y el {zona_lista[1]} % del alto, "
+                 "de lado a lado: sin texto ni elementos importantes, ahí se pondrá después un horario. El título va "
+                 f"arriba, por encima del {zona_lista[0]} %, y el mensaje destacado y los datos, abajo, por debajo del "
+                 f"{zona_lista[1]} %.")
     if zona_logo:
         p.append(f"- Deja COMPLETAMENTE VACÍA la esquina de arriba a la izquierda (el {zona_logo[0]} % del ancho y el "
                  f"{zona_logo[1]} % del alto): ahí se pondrá el logo después. No dibujes ningún logotipo ni marca.")

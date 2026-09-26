@@ -59,6 +59,11 @@ enseña lo de ese tipo: **Normal** (tus fotos y textos, los días que elijas), *
    «Cartel con lista» el horario sale en el centro de la imagen.
 5. En cualquier publicación puedes marcar **fotos de varias categorías**.
 
+- Con el diseño **IA completa**, el horario (o los deportes) lo pone **el panel encima**, en un
+  hueco que se le pide a la IA en el centro (horas siempre exactas, recomendado), o lo escribe
+  **la IA** (más integrado, pero puede equivocarse en alguna hora: sale un aviso para revisarlo).
+  Si un deporte no tiene fotos, la IA parte del fondo genérico de ese deporte.
+
 ## B1b. Deportes en TV para la cafetería (F1, MotoGP, fútbol)
 
 - **Publicaciones → + F1 y MotoGP**: los jueves a las 12:00, con la clasificación, el sprint y
