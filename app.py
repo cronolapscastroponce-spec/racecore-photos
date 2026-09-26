@@ -4,7 +4,7 @@ Banco de fotos por categorías, publicaciones programadas y un programador que
 deja la imagen (foto + texto superpuesto) y el texto del post listos a su hora.
 Tú publicas a mano; el panel solo prepara.
 Las publicaciones en modo «Eventos» se programan respecto a los eventos que el
-panel lee de Racecore por la red local (o que se crean a mano).
+panel lee de Racecore y de CKS por la red local (o que se crean a mano).
 
 Arranque: doble clic en 2_probar.bat  (o: .venv\\Scripts\\python app.py --abrir)
 Panel:    http://localhost:5000
@@ -57,8 +57,12 @@ LADO_MAX_FOTO = 3000                # las fotos se guardan como mucho a este tam
 Image.MAX_IMAGE_PIXELS = 400_000_000  # fotos de móvil de 200 MP
 GRACIA = timedelta(minutes=10)      # margen si el PC estaba ocupado justo a la hora
 DIAS_CONSERVAR = 60                 # las imágenes generadas se borran pasado este tiempo
-CADA_SINCRONIZAR = 600              # segundos entre lecturas de Racecore
-RACECORE_PUERTO = 8100
+CADA_SINCRONIZAR = 600              # segundos entre lecturas de Racecore y CKS
+# Programas de cronometraje de los que se leen los eventos (los dos dan el mismo JSON)
+FUENTES = {
+    "racecore": {"nombre": "Racecore", "ruta": "/api/publico/eventos", "puerto": 8100},
+    "cks": {"nombre": "CKS", "ruta": "/api/publico/competiciones", "puerto": 8090},
+}
 MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
 CONDICIONES = {"": "Siempre", "abierta": "Solo con la inscripción abierta", "plazas": "Solo si quedan plazas",
                "resultados": "Solo cuando haya resultados"}
@@ -72,7 +76,7 @@ AJUSTES_ENV = {
 }
 
 log = logging.getLogger("racecore")
-ESTADO = {"ultima_comprobacion": None, "racecore_ok": None, "racecore_error": "", "racecore_n": None}
+ESTADO = {"ultima_comprobacion": None, "fuentes": {f: {"ok": None, "error": "", "n": None} for f in FUENTES}}
 DIBUJO = threading.Lock()   # las fuentes de Pillow no se deben usar en dos hilos a la vez
 
 
@@ -103,7 +107,7 @@ CREATE TABLE IF NOT EXISTS generadas (
     con_ia INTEGER NOT NULL DEFAULT 0, aviso TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL,
     estilo TEXT NOT NULL DEFAULT '', evento_id INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
--- Eventos leídos de Racecore (origen 'racecore') o creados a mano ('manual').
+-- Eventos leídos de Racecore o CKS (origen 'racecore' o 'cks') o creados a mano ('manual').
 -- Solo lo necesario para las publicaciones: nada de datos personales salvo el podio.
 CREATE TABLE IF NOT EXISTS eventos (
     id INTEGER PRIMARY KEY, origen TEXT NOT NULL, ext_id TEXT NOT NULL,
@@ -279,7 +283,7 @@ def resumen_programacion(pub):
 
 
 # ---------------------------------------------------------------- eventos
-# El panel lee los eventos de Racecore por la red local (solo lectura, con token) y
+# El panel lee los eventos de Racecore y CKS por la red local (solo lectura, con token) y
 # las publicaciones en modo «Eventos» se programan respecto a la fecha de cada uno:
 # «cada 2 días de 14 a 3 días antes», «1 día después»... Los datos del evento
 # ({evento}, {inscritos}, {horarios}...) se ponen en los textos antes de dibujar.
@@ -288,7 +292,7 @@ SINCRONIZAR = threading.Lock()
 
 
 class ErrorFuente(Exception):
-    """Fallo al leer Racecore, con un mensaje que se entiende."""
+    """Fallo al leer Racecore o CKS, con un mensaje que se entiende."""
 
 
 def txt(valor):
@@ -338,7 +342,7 @@ def leer_hora(texto):
 
 
 def texto_horarios(horarios):
-    """Horarios de Racecore como texto: una línea por tanda («09:00-09:10 · Entrenos · Cat A»)."""
+    """Horarios como texto: una línea por tanda («09:00-09:10 · Entrenos · Cat A»)."""
     lineas = []
     for h in horarios:
         if len(horarios) > 1 and txt(h.get("nombre")):
@@ -431,8 +435,8 @@ def texto_pilotos(pilotos, formato):
     return "\n".join(lineas)
 
 
-def evento_de_racecore(e):
-    """Del JSON de Racecore solo se guarda lo que hace falta para las publicaciones."""
+def evento_de_fuente(e):
+    """Del JSON de Racecore o CKS solo se guarda lo que hace falta para las publicaciones."""
     horarios = [h for h in (e.get("horarios") or []) if isinstance(h, dict)]
     resultados = [r for r in (e.get("resultados") or []) if isinstance(r, dict)]
     fecha = leer_fecha(e.get("fecha_iso")) or leer_fecha(e.get("fecha"))
@@ -451,9 +455,9 @@ def evento_de_racecore(e):
     }
 
 
-def url_racecore():
-    """«192.168.1.50» -> «http://192.168.1.50:8100». Vacío si no está configurado."""
-    url = ajuste("racecore_url").strip()
+def url_fuente(fuente):
+    """«192.168.1.50» -> «http://192.168.1.50:8100» (8090 en CKS). Vacío si no está configurado."""
+    url = ajuste(f"{fuente}_url").strip()
     if not url:
         return ""
     if "://" not in url:
@@ -463,80 +467,82 @@ def url_racecore():
         puerto = partes.port
     except ValueError:
         puerto = None
-    host = partes.netloc if puerto else f"{partes.hostname}:{RACECORE_PUERTO}"
+    host = partes.netloc if puerto else f"{partes.hostname}:{FUENTES[fuente]['puerto']}"
     return f"{partes.scheme}://{host}"
 
 
-def leer_racecore():
-    base = url_racecore()
+def leer_fuente(fuente):
+    base, nombre, ruta = url_fuente(fuente), FUENTES[fuente]["nombre"], FUENTES[fuente]["ruta"]
     try:
-        r = requests.get(f"{base}/api/publico/eventos", headers={"X-Token": ajuste("racecore_token")}, timeout=10)
+        r = requests.get(f"{base}{ruta}", headers={"X-Token": ajuste(f"{fuente}_token")}, timeout=10)
     except requests.RequestException:
-        raise ErrorFuente(f"No hay conexión con {base}. Mira que el PC de Racecore esté encendido, "
-                          "en la misma red y con Racecore abierto.") from None
+        raise ErrorFuente(f"No hay conexión con {base}. Mira que el PC de {nombre} esté encendido, "
+                          f"en la misma red y con {nombre} abierto.") from None
     if r.status_code == 404:
-        raise ErrorFuente("Racecore todavía no tiene la dirección para el panel (/api/publico/eventos).")
+        raise ErrorFuente(f"{nombre} todavía no tiene la dirección para el panel ({ruta}).")
     if r.status_code == 401:
-        raise ErrorFuente("Racecore dice que el token no es correcto.")
+        raise ErrorFuente(f"{nombre} dice que el token no es correcto.")
     if r.status_code == 403:
-        raise ErrorFuente("En Racecore falta generar el token de lectura.")
+        raise ErrorFuente(f"En {nombre} falta generar el token de lectura.")
     if r.status_code != 200:
-        raise ErrorFuente(f"Racecore ha respondido con un error ({r.status_code}).")
+        raise ErrorFuente(f"{nombre} ha respondido con un error ({r.status_code}).")
     try:
         eventos = r.json()["eventos"]
     except (ValueError, KeyError, TypeError):
         eventos = None
     if not isinstance(eventos, list):
-        raise ErrorFuente("La respuesta de Racecore no tiene el formato esperado.")
+        raise ErrorFuente(f"La respuesta de {nombre} no tiene el formato esperado.")
     return [e for e in eventos
             if isinstance(e, dict) and e.get("id") is not None and e.get("tipo") != "campeonato"]
 
 
-def sincronizar():
-    """Lee Racecore y actualiza la tabla eventos. Devuelve cuántos hay (None si no está configurado)."""
-    if not ajuste("racecore_url"):
-        ESTADO.update(racecore_error="", racecore_n=None)
+def sincronizar(fuente="racecore"):
+    """Lee Racecore o CKS y actualiza la tabla eventos. Devuelve cuántos hay (None si no está configurado)."""
+    estado = ESTADO["fuentes"][fuente]
+    if not ajuste(f"{fuente}_url"):
+        estado.update(error="", n=None)
         return None
     with SINCRONIZAR:
         try:
-            eventos = leer_racecore()
+            eventos = leer_fuente(fuente)
         except ErrorFuente as e:
-            ESTADO["racecore_error"] = str(e)
+            estado["error"] = str(e)
             raise
         marca = ahora_txt()
         c = conectar()
         try:
             for e in eventos:
-                fila = evento_de_racecore(e) | {"origen": "racecore", "ext_id": str(e["id"]), "actualizado": marca,
-                                                "en_fuente": 1}
+                fila = evento_de_fuente(e) | {"origen": fuente, "ext_id": str(e["id"]), "actualizado": marca,
+                                              "en_fuente": 1}
                 cols = list(fila)
                 c.execute(f"INSERT INTO eventos ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
                           f"ON CONFLICT(origen, ext_id) DO UPDATE SET "
                           f"{', '.join(f'{k} = excluded.{k}' for k in cols)}", [fila[k] for k in cols])
-            # Los que ya no manda Racecore (borrados, o pasados hace días) se ocultan y no se programan.
+            # Los que ya no manda (borrados, o pasados hace días) se ocultan y no se programan.
             # No se borran: si vuelven, conservan las fotos elegidas. Pasados 60 días, sí se borran.
             vistos = [str(e["id"]) for e in eventos]
             no_vistos = f" AND ext_id NOT IN ({', '.join('?' for _ in vistos)})" if vistos else ""
-            c.execute(f"UPDATE eventos SET en_fuente = 0 WHERE origen = 'racecore'{no_vistos}", vistos)
+            c.execute(f"UPDATE eventos SET en_fuente = 0 WHERE origen = ?{no_vistos}", [fuente] + vistos)
             limite = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
-            c.execute("DELETE FROM eventos WHERE origen = 'racecore' AND en_fuente = 0 AND actualizado < ?",
-                      (limite,))
+            c.execute("DELETE FROM eventos WHERE origen = ? AND en_fuente = 0 AND actualizado < ?",
+                      (fuente, limite))
             c.commit()
         finally:
             c.close()
-        ESTADO.update(racecore_ok=datetime.now(), racecore_error="", racecore_n=len(eventos))
+        estado.update(ok=datetime.now(), error="", n=len(eventos))
         return len(eventos)
 
 
 def sincronizar_seguro():
-    """Para el programador: si Racecore falla se queda anotado y se siguen usando los últimos datos."""
-    try:
-        sincronizar()
-    except ErrorFuente as e:
-        log.warning("Racecore: %s", e)
-    except Exception as e:
-        ESTADO["racecore_error"] = f"Error leyendo Racecore: {e}"
-        log.exception("Racecore")
+    """Para el programador: si Racecore o CKS fallan se queda anotado y se siguen usando los últimos datos."""
+    for fuente, datos in FUENTES.items():
+        try:
+            sincronizar(fuente)
+        except ErrorFuente as e:
+            log.warning("%s: %s", datos["nombre"], e)
+        except Exception as e:
+            ESTADO["fuentes"][fuente]["error"] = f"Error leyendo {datos['nombre']}: {e}"
+            log.exception(datos["nombre"])
 
 
 def desfases(pub):
@@ -686,11 +692,12 @@ def con_evento(pub, ev, occ):
         datos["categoria_id"] = ev["categoria_id"]
     datos["_aviso"] = ""
     if datos["diseno"] == "lista" and not datos["lista"].strip():
-        datos["_aviso"] = "La lista de nombres está vacía: en Eventos mira si llegan los nombres de Racecore. "
-    if ev["origen"] == "racecore" and ev["actualizado"]:
+        datos["_aviso"] = "La lista de nombres está vacía: en Eventos mira si llegan los nombres de los inscritos. "
+    if ev["origen"] in FUENTES and ev["actualizado"]:
         leido = datetime.strptime(ev["actualizado"], "%Y-%m-%d %H:%M:%S")
         if datetime.now() - leido > timedelta(hours=3):
-            datos["_aviso"] += (f"Ojo: datos de Racecore del {leido:%d/%m %H:%M} (no se han podido actualizar). "
+            datos["_aviso"] += (f"Ojo: datos de {FUENTES[ev['origen']]['nombre']} del {leido:%d/%m %H:%M} "
+                                "(no se han podido actualizar). "
                                 "Revisa los números antes de publicar.")
     return datos
 
@@ -1409,7 +1416,7 @@ def generar(gen_id, pub, occ, enviar=False):
         archivo = f"{pub['id']}_{occ:%Y%m%d_%H%M}_{gen_id}_{uuid.uuid4().hex[:6]}.jpg"
         img.save(DIR_GEN / archivo, "JPEG", quality=92, optimize=True)
         texto = variables(pub["texto"], occ)
-        if "_aviso" in pub.keys():  # publicaciones de eventos: p. ej. datos de Racecore sin actualizar
+        if "_aviso" in pub.keys():  # publicaciones de eventos: p. ej. datos de Racecore o CKS sin actualizar
             aviso = " ".join(a for a in (pub["_aviso"], aviso) if a)
         cur = ejecutar("UPDATE generadas SET estado = 'lista', archivo = ?, texto = ?, foto_id = ?, con_ia = ?, "
                        "aviso = ?, estilo = ? WHERE id = ? AND estado = 'generando'",
@@ -1788,25 +1795,30 @@ def borrar_publicacion(pub_id):
 
 # --- Eventos
 
-def estado_racecore():
-    ok = ESTADO["racecore_ok"]
-    return {"configurado": bool(ajuste("racecore_url")), "url": url_racecore(), "error": ESTADO["racecore_error"],
-            "ok": ok.strftime("%d/%m %H:%M") if ok else "", "n": ESTADO["racecore_n"]}
+def estado_fuentes():
+    res = []
+    for fuente, datos in FUENTES.items():
+        estado = ESTADO["fuentes"][fuente]
+        res.append({"clave": fuente, "nombre": datos["nombre"], "configurado": bool(ajuste(f"{fuente}_url")),
+                    "url": url_fuente(fuente), "error": estado["error"], "n": estado["n"],
+                    "ok": estado["ok"].strftime("%d/%m %H:%M") if estado["ok"] else ""})
+    return res
 
 
-def leer_ahora():
-    """Lee Racecore ahora mismo y lo cuenta con un mensaje."""
-    try:
-        n = sincronizar()
-        if n is None:
-            flash("Racecore no está configurado: pon su dirección y el token en Ajustes.", "error")
-        else:
-            flash(f"Racecore: {n} evento(s) leído(s).", "ok")
-    except ErrorFuente as e:
-        flash(f"Racecore: {e}", "error")
-    except Exception as e:
-        log.exception("Racecore")
-        flash(f"Error leyendo Racecore: {e}", "error")
+def leer_ahora(fuentes=None):
+    """Lee Racecore y CKS (o las fuentes indicadas) ahora mismo y lo cuenta con un mensaje."""
+    fuentes = [f for f in (fuentes or FUENTES) if ajuste(f"{f}_url")]
+    if not fuentes:
+        flash("Ni Racecore ni CKS están configurados: pon su dirección y su token en Ajustes.", "error")
+    for fuente in fuentes:
+        nombre = FUENTES[fuente]["nombre"]
+        try:
+            flash(f"{nombre}: {sincronizar(fuente)} evento(s) leído(s).", "ok")
+        except ErrorFuente as e:
+            flash(f"{nombre}: {e}", "error")
+        except Exception as e:
+            log.exception(nombre)
+            flash(f"Error leyendo {nombre}: {e}", "error")
 
 
 @app.route("/eventos")
@@ -1838,7 +1850,8 @@ def eventos():
     filas.sort(key=lambda e: e["orden"])
     hay_reglas = bool(consulta("SELECT 1 FROM publicaciones WHERE modo = 'evento' LIMIT 1"))
     faltan = sum(1 for e in EJEMPLOS if not consulta("SELECT 1 FROM publicaciones WHERE nombre = ?", (e["nombre"],)))
-    return render_template("eventos.html", eventos=filas, racecore=estado_racecore(), hay_reglas=hay_reglas,
+    return render_template("eventos.html", eventos=filas, fuentes=estado_fuentes(), hay_reglas=hay_reglas,
+                           nombres_fuente={f: d["nombre"] for f, d in FUENTES.items()},
                            hay_activas=bool(reglas), faltan_ejemplos=faltan,
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"))
 
@@ -1880,7 +1893,7 @@ def evento_manual_o_404(ev_id):
 @app.route("/eventos/nuevo", methods=["GET", "POST"])
 @app.route("/eventos/<int:ev_id>", methods=["GET", "POST"])
 def editar_evento(ev_id=None):
-    """Eventos a mano: para lo que no está en Racecore (o mientras no esté conectado)."""
+    """Eventos a mano: para lo que no está en Racecore ni en CKS (o mientras no estén conectados)."""
     ev = dict(evento_manual_o_404(ev_id)) if ev_id else dict(EVENTO_NUEVO)
     if request.method == "POST":
         f = request.form
@@ -2085,10 +2098,12 @@ def borrar_categoria(cat_id):
 @app.route("/ajustes", methods=["GET", "POST"])
 def ajustes():
     if request.method == "POST":
-        antes = (ajuste("racecore_url"), ajuste("racecore_token"), ajuste("nombres_formato", "completo"))
-        guardar_ajuste("racecore_url", request.form.get("racecore_url", "").strip())
+        antes = {f: (ajuste(f"{f}_url"), ajuste(f"{f}_token")) for f in FUENTES}
+        formato_antes = ajuste("nombres_formato", "completo")
+        for f in FUENTES:
+            guardar_ajuste(f"{f}_url", request.form.get(f"{f}_url", "").strip())
         guardar_ajuste("nombres_formato", "inicial" if request.form.get("nombres_formato") == "inicial" else "completo")
-        for clave in ("openai_key", "telegram_token", "racecore_token"):
+        for clave in ("openai_key", "telegram_token", *(f"{f}_token" for f in FUENTES)):
             nuevo = request.form.get(clave, "").strip()
             if request.form.get(f"quitar_{clave}"):
                 guardar_ajuste(clave, "")
@@ -2100,9 +2115,11 @@ def ajustes():
         calidad = request.form.get("openai_calidad", "medium")
         guardar_ajuste("openai_calidad", calidad if calidad in ("low", "medium", "high") else "medium")
         flash("Ajustes guardados.", "ok")
-        if ajuste("racecore_url") and (ajuste("racecore_url"), ajuste("racecore_token"),
-                                       ajuste("nombres_formato", "completo")) != antes:
-            leer_ahora()  # se prueba la conexión nueva enseguida (y se rehacen los nombres)
+        # se prueba enseguida la conexión que haya cambiado (y si cambia el formato, se rehacen los nombres)
+        cambiadas = [f for f in FUENTES if ajuste(f"{f}_url") and (
+            (ajuste(f"{f}_url"), ajuste(f"{f}_token")) != antes[f] or ajuste("nombres_formato", "completo") != formato_antes)]
+        if cambiadas:
+            leer_ahora(cambiadas)
         return redirect(url_for("ajustes"))
 
     def oculta(clave):
@@ -2112,7 +2129,8 @@ def ajustes():
     ultima = ESTADO["ultima_comprobacion"]
     return render_template(
         "ajustes.html", openai_key=oculta("openai_key"), telegram_token=oculta("telegram_token"),
-        racecore_url=ajuste("racecore_url"), racecore_token=oculta("racecore_token"), racecore=estado_racecore(),
+        conexiones=[f | {"url_ajuste": ajuste(f"{f['clave']}_url"), "token": oculta(f"{f['clave']}_token")}
+                    for f in estado_fuentes()],
         nombres_formato=ajuste("nombres_formato", "completo"),
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
         ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
@@ -2408,7 +2426,7 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   </div>
   <div id="fecha"><label>Fecha</label><input type="date" name="fecha" value="{{ pub.fecha }}"></div>
   <div id="evento">
-    <div class="ayuda">Se publica sola para cada evento de la pestaña Eventos (los de Racecore y los creados a mano).</div>
+    <div class="ayuda">Se publica sola para cada evento de la pestaña Eventos (los de Racecore, los de CKS y los creados a mano).</div>
     <div class="dos">
       <div><label>¿Cuándo, respecto al evento?</label>
         <select name="momento">{% for clave, t in momentos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.momento }}>{{ t }}</option>{% endfor %}</select></div>
@@ -2648,13 +2666,17 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   </div>
 </div>
 <div class="caja">
-  <b>Racecore (para la pestaña Eventos)</b>
-  <div class="ayuda">El panel lee los eventos de Racecore por la red del circuito: solo lectura y sin datos personales.</div>
-  <label>Dirección del PC de Racecore</label>
-  <input type="text" name="racecore_url" value="{{ racecore_url }}" placeholder="Ej: 192.168.1.50  (puerto 8100 si no pones otro)">
-  <label>Token de lectura {% if racecore_token %}<span class="chip on">{{ racecore_token }}</span>{% endif %}</label>
-  <input type="password" name="racecore_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if racecore_token else 'El que genera Racecore en sus Ajustes' }}" autocomplete="off">
-  {% if racecore_token %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_racecore_token" value="1"> Quitar el token</label>{% endif %}
+  <b>Racecore y CKS (para la pestaña Eventos)</b>
+  <div class="ayuda">El panel lee los eventos por la red del circuito: solo lectura y solo lo necesario para las publicaciones.</div>
+  {% for f in conexiones %}
+  <div class="dos" style="margin-top:6px">
+    <div><label>Dirección del PC de {{ f.nombre }}</label>
+      <input type="text" name="{{ f.clave }}_url" value="{{ f.url_ajuste }}" placeholder="Ej: 192.168.1.50  (puerto {{ '8100' if f.clave == 'racecore' else '8090' }} si no pones otro)"></div>
+    <div><label>Token de lectura de {{ f.nombre }} {% if f.token %}<span class="chip on">{{ f.token }}</span>{% endif %}</label>
+      <input type="password" name="{{ f.clave }}_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if f.token else 'El que genera ' ~ f.nombre ~ ' en su configuración' }}" autocomplete="off">
+      {% if f.token %}<label style="color:var(--texto); margin-top:6px"><input type="checkbox" name="quitar_{{ f.clave }}_token" value="1"> Quitar el token</label>{% endif %}</div>
+  </div>
+  {% endfor %}
   <label>Nombres de los pilotos en redes ({pilotos})</label>
   <select name="nombres_formato">
     <option value="completo" {{ 'selected' if nombres_formato != 'inicial' }}>Nombre y primer apellido (Ana Pérez)</option>
@@ -2688,16 +2710,18 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 <div class="fila" style="margin-top:10px">
   <form class="enlinea" method="post" action="{{ url_for('detectar_telegram') }}"><button>Detectar mi chat</button></form>
   <form class="enlinea" method="post" action="{{ url_for('probar_telegram') }}"><button>Probar Telegram</button></form>
-  <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><input type="hidden" name="volver" value="ajustes"><button>Probar Racecore</button></form>
+  <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><input type="hidden" name="volver" value="ajustes"><button>Probar Racecore y CKS</button></form>
 </div>
 
 <h2>Estado</h2>
 <div class="caja">
   <div>Programador: {% if ultima %}<span class="chip on">funcionando</span> última comprobación {{ ultima }}{% else %}<span class="chip">arrancando…</span>{% endif %}</div>
-  <div>Racecore: {% if not racecore.configurado %}<span class="chip">sin configurar</span>
-    {% elif racecore.error %}<span class="chip error">sin conexión</span> <span class="ayuda">{{ racecore.error }}</span>
-    {% elif racecore.ok %}<span class="chip on">conectado</span> última lectura {{ racecore.ok }} · {{ racecore.n }} evento(s)
+  {% for f in conexiones %}
+  <div>{{ f.nombre }}: {% if not f.configurado %}<span class="chip">sin configurar</span>
+    {% elif f.error %}<span class="chip error">sin conexión</span> <span class="ayuda">{{ f.error }}</span>
+    {% elif f.ok %}<span class="chip on">conectado</span> última lectura {{ f.ok }} · {{ f.n }} evento(s)
     {% else %}<span class="chip">pendiente</span>{% endif %}</div>
+  {% endfor %}
   <div>Fuentes propias: {% if fuentes %}<span class="chip on">{{ fuentes|join(', ') }}</span>{% else %}<span class="chip">las incluidas</span> <span class="ayuda">opcional: Titulo.ttf y Texto.ttf en la carpeta «fuentes»</span>{% endif %}</div>
   <div class="ayuda" style="margin-top:8px">Carpeta del panel: {{ carpeta }}</div>
 </div>
@@ -2707,18 +2731,19 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
 {% block contenido %}
 <div class="fila" style="justify-content:space-between"><h1>Eventos</h1>
 <div class="fila">
-  <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><button>Actualizar desde Racecore</button></form>
+  <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><button>Actualizar ahora</button></form>
   <a class="boton" href="{{ url_for('editar_evento') }}">+ Evento a mano</a>
 </div></div>
 <div class="caja">
-  <b>Racecore</b>
-  {% if not racecore.configurado %}<span class="chip">sin configurar</span>
-  <div class="ayuda">Pon la dirección y el token de Racecore en <a href="{{ url_for('ajustes') }}">Ajustes</a>. Mientras tanto puedes crear eventos a mano.</div>
-  {% elif racecore.error %}<span class="chip error">sin conexión</span>
-  <div class="aviso">{{ racecore.error }}{% if racecore.ok %} Se usan los datos leídos el {{ racecore.ok }}.{% endif %}</div>
-  {% elif racecore.ok %}<span class="chip on">conectado</span> <span class="ayuda">última lectura {{ racecore.ok }} · {{ racecore.n }} evento(s)</span>
-  {% else %}<span class="chip">leyendo…</span>{% endif %}
-  <div class="ayuda">El panel lee Racecore cada 10 minutos. Solo guarda lo necesario para las publicaciones: nombre, fecha, horarios, plazas, número de inscritos, precio, enlaces y el podio.</div>
+  {% for f in fuentes %}
+  <div style="margin-bottom:6px"><b>{{ f.nombre }}</b>
+  {% if not f.configurado %}<span class="chip">sin configurar</span> <span class="ayuda">pon su dirección y su token en <a href="{{ url_for('ajustes') }}">Ajustes</a></span>
+  {% elif f.error %}<span class="chip error">sin conexión</span>
+  <div class="aviso">{{ f.error }}{% if f.ok %} Se usan los datos leídos el {{ f.ok }}.{% endif %}</div>
+  {% elif f.ok %}<span class="chip on">conectado</span> <span class="ayuda">última lectura {{ f.ok }} · {{ f.n }} evento(s)</span>
+  {% else %}<span class="chip">leyendo…</span>{% endif %}</div>
+  {% endfor %}
+  <div class="ayuda">El panel los lee cada 10 minutos (también puedes crear eventos a mano). Solo guarda lo necesario para las publicaciones: nombre, fecha, horarios, plazas, inscritos, precio, enlaces, el podio y el nombre para redes de cada inscrito.</div>
 </div>
 
 {% if not hay_reglas %}
@@ -2740,11 +2765,11 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
   <div class="fila" style="justify-content:space-between; align-items:flex-start">
     <div>
       <b>{{ ev.nombre }}</b>
-      <span class="chip">{{ 'a mano' if ev.origen == 'manual' else 'Racecore' }}</span>
+      <span class="chip">{{ nombres_fuente.get(ev.origen, 'a mano') }}</span>
       {% if ev.pasado %}<span class="chip">ya pasó</span>{% endif %}
       {% if ev.cuando %}<div class="ayuda">{{ ev.cuando }}{% if ev.campeonato %} · {{ ev.campeonato }}{% endif %}</div>
       {% else %}<div class="aviso">{% if ev.fecha_txt %}No entiendo la fecha «{{ ev.fecha_txt }}»{% else %}No tiene fecha{% endif %}: para este evento no se programa nada.</div>{% endif %}
-      <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Nombres: {{ ev.n_nombres if ev.n_nombres else ('no llegan de Racecore' if ev.origen == 'racecore' else '—') }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
+      <div class="ayuda">Inscritos: {{ ev.inscritos_txt }} · Nombres: {{ ev.n_nombres if ev.n_nombres else ('no llegan de ' ~ nombres_fuente[ev.origen] if ev.origen in nombres_fuente else '—') }} · Precio: {{ ev.precio or '—' }} · Inscripción {{ 'abierta' if ev.abierta else 'cerrada' }}</div>
       <form method="post" action="{{ url_for('fotos_evento', ev_id=ev.id) }}" class="fila" style="margin-top:6px">
         <span class="ayuda">Fotos:</span>
         <select name="categoria_id" onchange="this.form.submit()" style="width:auto">
@@ -2779,7 +2804,7 @@ Resultados:
   </details>
 </div>
 {% else %}
-<div class="vacio">No hay eventos.<br>Conecta Racecore en Ajustes o crea uno con «+ Evento a mano».</div>
+<div class="vacio">No hay eventos.<br>Conecta Racecore o CKS en Ajustes, o crea uno con «+ Evento a mano».</div>
 {% endfor %}
 {% if hay_reglas and faltan_ejemplos %}
 <form method="post" action="{{ url_for('crear_ejemplos') }}" style="margin-top:20px">

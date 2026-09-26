@@ -40,17 +40,17 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Marcar como publicada.
 - **Ajustes**: la clave de OpenAI y Telegram (opcional). El estado del programador.
 
-## B2. Eventos (Racecore)
+## B2. Eventos (Racecore y CKS)
 
-El panel lee los eventos de Racecore por la red del circuito y prepara solas las publicaciones
-de cada evento: recordatorios, horarios, inscritos, resultados…
+El panel lee los eventos de Racecore y de CKS por la red del circuito y prepara solas las
+publicaciones de cada evento: recordatorios, horarios, inscritos, resultados…
 
-1. En Racecore: genera el **token de lectura** (en sus Ajustes) y cópialo.
-2. En el panel, **Ajustes → Racecore**: pon la IP del PC de Racecore (ej. `192.168.1.50`;
-   el puerto 8100 se pone solo) y el token. Guarda: el panel prueba la conexión al momento.
-3. Pestaña **Eventos**: salen los eventos de Racecore. Se actualizan cada 10 minutos.
-   - Si Racecore no responde, se siguen usando los últimos datos y se avisa.
-   - También puedes crear **eventos a mano** (para lo que no esté en Racecore).
+1. En Racecore (y en CKS): genera el **token de lectura** en su configuración y cópialo.
+2. En el panel, **Ajustes → Racecore y CKS**: pon la IP de cada PC (ej. `192.168.1.50`; el puerto
+   se pone solo: 8100 en Racecore, 8090 en CKS) y su token. Guarda: el panel prueba la conexión.
+3. Pestaña **Eventos**: salen los eventos de los dos. Se actualizan cada 10 minutos.
+   - Si alguno no responde, se siguen usando los últimos datos y se avisa.
+   - También puedes crear **eventos a mano** (para lo que no esté en Racecore ni en CKS).
 4. Publicaciones para eventos: en **Eventos → Crear las 5 de ejemplo**. Se crean **en pausa**:
    elige la categoría de fotos, prueba con «Generar ahora» y actívalas.
    - Son publicaciones normales con el modo **Eventos**: antes, el mismo día o después del
