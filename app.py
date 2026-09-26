@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS eventos (
     plazas INTEGER, inscritos INTEGER, precio TEXT NOT NULL DEFAULT '', abierta INTEGER NOT NULL DEFAULT 0,
     enlace TEXT NOT NULL DEFAULT '', web TEXT NOT NULL DEFAULT '', horarios TEXT NOT NULL DEFAULT '',
     resultados TEXT NOT NULL DEFAULT '', ganadores TEXT NOT NULL DEFAULT '', actualizado TEXT NOT NULL DEFAULT '',
-    categoria_id INTEGER, pilotos TEXT NOT NULL DEFAULT '', UNIQUE (origen, ext_id));
+    categoria_id INTEGER, pilotos TEXT NOT NULL DEFAULT '', en_fuente INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (origen, ext_id));
 """
 
 
@@ -174,7 +175,8 @@ def iniciar():
                                     "lista": "TEXT NOT NULL DEFAULT ''"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0"},
-                  "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''"}}
+                  "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''",
+                              "en_fuente": "INTEGER NOT NULL DEFAULT 1"}}
         for tabla, cols in nuevas.items():
             existentes = {f["name"] for f in c.execute(f"PRAGMA table_info({tabla})")}
             for col, tipo in cols.items():
@@ -505,13 +507,20 @@ def sincronizar():
         c = conectar()
         try:
             for e in eventos:
-                fila = evento_de_racecore(e) | {"origen": "racecore", "ext_id": str(e["id"]), "actualizado": marca}
+                fila = evento_de_racecore(e) | {"origen": "racecore", "ext_id": str(e["id"]), "actualizado": marca,
+                                                "en_fuente": 1}
                 cols = list(fila)
                 c.execute(f"INSERT INTO eventos ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
                           f"ON CONFLICT(origen, ext_id) DO UPDATE SET "
                           f"{', '.join(f'{k} = excluded.{k}' for k in cols)}", [fila[k] for k in cols])
-            # Los que ya no manda Racecore (borrados, o pasados hace días) se quitan
-            c.execute("DELETE FROM eventos WHERE origen = 'racecore' AND actualizado != ?", (marca,))
+            # Los que ya no manda Racecore (borrados, o pasados hace días) se ocultan y no se programan.
+            # No se borran: si vuelven, conservan las fotos elegidas. Pasados 60 días, sí se borran.
+            vistos = [str(e["id"]) for e in eventos]
+            no_vistos = f" AND ext_id NOT IN ({', '.join('?' for _ in vistos)})" if vistos else ""
+            c.execute(f"UPDATE eventos SET en_fuente = 0 WHERE origen = 'racecore'{no_vistos}", vistos)
+            limite = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("DELETE FROM eventos WHERE origen = 'racecore' AND en_fuente = 0 AND actualizado < ?",
+                      (limite,))
             c.commit()
         finally:
             c.close()
@@ -581,7 +590,7 @@ def resumen_filtro(texto):
 def eventos_de(pub, eventos=None):
     """Eventos a los que se aplica la publicación: todos, o los de los campeonatos y eventos
     marcados, o los que contienen el texto del filtro."""
-    eventos = consulta("SELECT * FROM eventos") if eventos is None else eventos
+    eventos = consulta("SELECT * FROM eventos WHERE en_fuente = 1") if eventos is None else eventos
     f = leer_filtro(pub["filtro"])
     if not (f["campeonatos"] or f["eventos"] or f["texto"]):
         return list(eventos)
@@ -1448,7 +1457,7 @@ def comprobar(ahora=None):
         antelacion = timedelta(minutes=max(0, pub["antelacion"]))
         if pub["modo"] == "evento":
             if eventos is None:
-                eventos = consulta("SELECT * FROM eventos")
+                eventos = consulta("SELECT * FROM eventos WHERE en_fuente = 1")
             for occ, ev in ocurrencias_evento(pub, ahora - GRACIA, ahora + antelacion, eventos):
                 # si no se cumple la condición (p. ej. aún no hay resultados) se vuelve a mirar después
                 if cumple(pub, ev):
@@ -1704,7 +1713,7 @@ def editar_publicacion(pub_id=None):
             return redirect(url_for("publicaciones"))
     # Para marcar: los campeonatos y los eventos de ahora (sin los ya pasados), más los ya marcados
     filtro = leer_filtro(pub["filtro"])
-    todos = consulta("SELECT nombre, campeonato, fecha FROM eventos ORDER BY fecha, nombre")
+    todos = consulta("SELECT nombre, campeonato, fecha FROM eventos WHERE en_fuente = 1 ORDER BY fecha, nombre")
     desde = date.today() - timedelta(days=10)
     campeonatos = sorted({e["campeonato"] for e in todos if e["campeonato"]} | set(filtro["campeonatos"]),
                          key=str.casefold)
@@ -1793,7 +1802,7 @@ def eventos():
     hoy = ahora.date()
     reglas = consulta("SELECT * FROM publicaciones WHERE modo = 'evento' AND activa = 1")
     filas = []
-    for ev in consulta("SELECT * FROM eventos"):
+    for ev in consulta("SELECT * FROM eventos WHERE en_fuente = 1"):
         f = leer_fecha(ev["fecha"])
         if f and f < hoy - timedelta(days=30):
             continue
