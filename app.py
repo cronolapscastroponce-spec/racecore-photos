@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS generadas (
     prueba INTEGER NOT NULL DEFAULT 0, estado TEXT NOT NULL DEFAULT 'generando',
     archivo TEXT, texto TEXT NOT NULL DEFAULT '', foto_id INTEGER,
     con_ia INTEGER NOT NULL DEFAULT 0, aviso TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL,
-    estilo TEXT NOT NULL DEFAULT '', evento_id INTEGER NOT NULL DEFAULT 0);
+    estilo TEXT NOT NULL DEFAULT '', evento_id INTEGER NOT NULL DEFAULT 0, telegram TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
 -- Eventos leídos de Racecore o CKS (origen 'racecore' o 'cks') o creados a mano ('manual').
 -- Solo lo necesario para las publicaciones: nada de datos personales salvo el podio.
@@ -178,7 +178,8 @@ def iniciar():
                                     "condicion": "TEXT NOT NULL DEFAULT ''",
                                     "lista": "TEXT NOT NULL DEFAULT ''"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
-                                "evento_id": "INTEGER NOT NULL DEFAULT 0"},
+                                "evento_id": "INTEGER NOT NULL DEFAULT 0",
+                                "telegram": "TEXT NOT NULL DEFAULT ''"},
                   "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''",
                               "en_fuente": "INTEGER NOT NULL DEFAULT 1"}}
         for tabla, cols in nuevas.items():
@@ -1428,7 +1429,8 @@ def generar(gen_id, pub, occ, enviar=False):
             (DIR_GEN / anterior[0]["archivo"]).unlink(missing_ok=True)
         log.info("Lista: %s (%s)%s", pub["nombre"], cuando_txt(occ), " con IA" if con_ia else "")
         if enviar:
-            avisar_telegram(DIR_GEN / archivo, pub, occ, texto)
+            ejecutar("UPDATE generadas SET telegram = ? WHERE id = ?",
+                     (avisar_telegram(DIR_GEN / archivo, pub["nombre"], occ, texto), gen_id))
     except Exception as e:
         log.exception("Error generando «%s»", pub["nombre"])
         ejecutar("UPDATE generadas SET estado = 'error', aviso = ? WHERE id = ? AND estado = 'generando'",
@@ -1440,20 +1442,32 @@ def en_segundo_plano(gen_id, pub, occ):
     threading.Thread(target=generar, args=(gen_id, pub, occ), daemon=True).start()
 
 
-def avisar_telegram(ruta, pub, occ, texto):
+def avisar_telegram(ruta, nombre, occ, texto):
+    """Manda la imagen y su texto al móvil. Devuelve «ok», el motivo del fallo, o vacío si no está configurado."""
     token, chat = ajuste("telegram_token"), ajuste("telegram_chat")
     if not (token and chat):
-        return
+        return ""
     api = f"https://api.telegram.org/bot{token}"
+
+    def comprobar_respuesta(r):
+        if not r.ok:
+            try:
+                motivo = r.json().get("description")
+            except ValueError:
+                motivo = None
+            raise RuntimeError(motivo or f"error {r.status_code}")
     try:
         with open(ruta, "rb") as f:
-            requests.post(f"{api}/sendPhoto", timeout=60, files={"photo": f}, data={
-                "chat_id": chat, "caption": f"📣 {pub['nombre']} · publicar {cuando_txt(occ)}"}).raise_for_status()
+            comprobar_respuesta(requests.post(f"{api}/sendPhoto", timeout=60, files={"photo": f}, data={
+                "chat_id": chat, "caption": f"📣 {nombre} · publicar {cuando_txt(occ)}"}))
         if texto.strip():
-            requests.post(f"{api}/sendMessage", timeout=30,
-                          data={"chat_id": chat, "text": texto[:4096]}).raise_for_status()
+            comprobar_respuesta(requests.post(f"{api}/sendMessage", timeout=30,
+                                              data={"chat_id": chat, "text": texto[:4096]}))
+        return "ok"
     except Exception as e:
-        log.warning("Telegram: %s", str(e).replace(token, "***"))
+        motivo = str(e).replace(token, "***")
+        log.warning("Telegram: %s", motivo)
+        return motivo[:300]
 
 
 def comprobar(ahora=None):
@@ -1547,6 +1561,7 @@ def listas():
     return render_template("listas.html", filas=[preparar(g) for g in filas],
                            hechas=[preparar(g) for g in hechas],
                            n_pruebas=sum(1 for g in filas if g["prueba"] and g["estado"] != "generando"),
+                           hay_telegram=bool(ajuste("telegram_token") and ajuste("telegram_chat")),
                            generando=any(g["estado"] == "generando" for g in filas))
 
 
@@ -1581,6 +1596,27 @@ def otra_foto(gen_id):
         pub = con_evento(pub, ev[0], occ)
     ejecutar("UPDATE generadas SET estado = 'generando', aviso = '' WHERE id = ?", (gen_id,))
     en_segundo_plano(gen_id, pub, occ)
+    return redirect(url_for("listas"))
+
+
+@app.post("/generadas/<int:gen_id>/telegram")
+def enviar_telegram(gen_id):
+    """Manda (o vuelve a mandar) una imagen al móvil."""
+    g = consulta("""SELECT g.*, p.nombre, e.nombre AS evento FROM generadas g
+                    LEFT JOIN publicaciones p ON p.id = g.publicacion_id LEFT JOIN eventos e ON e.id = g.evento_id
+                    WHERE g.id = ?""", (gen_id,))
+    if not g or not g[0]["archivo"]:
+        abort(404)
+    g = g[0]
+    nombre = " · ".join(x for x in (g["nombre"], g["evento"]) if x) or "Publicación"
+    resultado = avisar_telegram(DIR_GEN / g["archivo"], nombre,
+                                datetime.strptime(g["ocurrencia"], "%Y-%m-%d %H:%M"), g["texto"])
+    if not resultado:
+        flash("Telegram no está configurado: pon el token y el chat en Ajustes.", "error")
+    else:
+        ejecutar("UPDATE generadas SET telegram = ? WHERE id = ?", (resultado, gen_id))
+        flash("Enviada a Telegram." if resultado == "ok" else f"Telegram ha fallado: {resultado}",
+              "ok" if resultado == "ok" else "error")
     return redirect(url_for("listas"))
 
 
@@ -2315,14 +2351,17 @@ PLANTILLAS["listas.html"] = """{% extends "base.html" %}
     <b>{{ g.nombre }}</b>{% if g.evento %} · {{ g.evento }}{% endif %}
     {% if g.prueba %}<span class="chip prueba">Prueba</span>{% endif %}
     {% if g.con_ia %}<span class="chip ia">IA{{ ' · ' ~ g.estilo_nombre if g.estilo_nombre }}</span>{% endif %}
+    {% if g.telegram == 'ok' %}<span class="chip on">Enviada a Telegram</span>{% endif %}
     <div class="ayuda">Publicar: {{ g.cuando }}</div>
     {% if g.aviso %}<div class="aviso">{{ g.aviso }}</div>{% endif %}
+    {% if g.telegram and g.telegram != 'ok' %}<div class="aviso">Telegram no la ha recibido: {{ g.telegram }}</div>{% endif %}
     {% if g.estado == 'lista' %}
     <textarea readonly id="texto{{ g.id }}">{{ g.texto }}</textarea>
     <div class="fila">
       <a class="boton principal" href="{{ url_for('archivo', carpeta='generadas', nombre=g.archivo, descargar=1) }}">Descargar imagen</a>
       <button type="button" onclick="copiar({{ g.id }}, this)">Copiar texto</button>
       <button type="button" class="compartir" hidden onclick="compartir('{{ url_for('archivo', carpeta='generadas', nombre=g.archivo) }}', {{ g.id }})">Compartir</button>
+      {% if hay_telegram %}<form class="enlinea" method="post" action="{{ url_for('enviar_telegram', gen_id=g.id) }}"><button>{{ 'Reenviar' if g.telegram == 'ok' else 'Enviar' }} a Telegram</button></form>{% endif %}
     </div>
     {% endif %}
     <div class="fila" style="margin-top:10px">
