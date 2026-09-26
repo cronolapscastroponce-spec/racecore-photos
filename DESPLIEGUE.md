@@ -75,6 +75,16 @@ publicaciones de cada evento: recordatorios, horarios, inscritos, resultados…
 - Datos personales: el panel solo guarda nombre, fecha, horarios, plazas, número de inscritos,
   precio, enlaces, el podio y el **nombre para redes** de cada inscrito (nada más de ellos).
 
+## B3. Fotos de las tandas de alquiler (CKS)
+
+1. En **Ajustes → Racecore y CKS**, en «Fotos de las tandas de alquiler», elige
+   «Traerlas a una categoría nueva: Tandas CKS» (o una categoría tuya) y guarda.
+2. Cada 10 minutos el panel trae las fotos nuevas. CKS solo da las de tandas en las que
+   **todos** los pilotos dieron permiso de imagen, y ningún nombre.
+3. Se guardan **una semana** y se borran solas; también si alguien retira el permiso.
+4. Úsalas como cualquier categoría: por ejemplo, una publicación diaria «Así fue hoy en pista»
+   con esa categoría de fotos. En la página de la categoría está «Traer fotos ahora».
+
 ## C. Clave de OpenAI (para el Prompt IA)
 
 1. Entra en platform.openai.com → **Billing** y añade saldo. La suscripción de ChatGPT no sirve.

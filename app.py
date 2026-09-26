@@ -9,6 +9,7 @@ panel lee de Racecore y de CKS por la red local (o que se crean a mano).
 Arranque: doble clic en 2_probar.bat  (o: .venv\\Scripts\\python app.py --abrir)
 Panel:    http://localhost:5000
 """
+import io
 import json
 import logging
 import os
@@ -63,6 +64,8 @@ FUENTES = {
     "racecore": {"nombre": "Racecore", "ruta": "/api/publico/eventos", "puerto": 8100},
     "cks": {"nombre": "CKS", "ruta": "/api/publico/competiciones", "puerto": 8090},
 }
+HORAS_TANDAS = 168                  # fotos de tandas de CKS: se guardan las de la última semana
+LADO_MAX_TANDA = 2400               # y algo más pequeñas que las subidas a mano (llegan muchas)
 MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
 CONDICIONES = {"": "Siempre", "abierta": "Solo con la inscripción abierta", "plazas": "Solo si quedan plazas",
                "resultados": "Solo cuando haya resultados"}
@@ -76,7 +79,8 @@ AJUSTES_ENV = {
 }
 
 log = logging.getLogger("racecore")
-ESTADO = {"ultima_comprobacion": None, "fuentes": {f: {"ok": None, "error": "", "n": None} for f in FUENTES}}
+ESTADO = {"ultima_comprobacion": None, "fuentes": {f: {"ok": None, "error": "", "n": None} for f in FUENTES},
+          "tandas": {"ok": None, "error": "", "nuevas": 0, "total": None, "no_publicables": None}}
 DIBUJO = threading.Lock()   # las fuentes de Pillow no se deben usar en dos hilos a la vez
 
 
@@ -86,7 +90,8 @@ ESQUEMA = """
 CREATE TABLE IF NOT EXISTS categorias (
     id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS fotos (
-    id INTEGER PRIMARY KEY, categoria_id INTEGER NOT NULL, archivo TEXT NOT NULL, subida TEXT NOT NULL);
+    id INTEGER PRIMARY KEY, categoria_id INTEGER NOT NULL, archivo TEXT NOT NULL, subida TEXT NOT NULL,
+    origen TEXT NOT NULL DEFAULT '', ext_url TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS publicaciones (
     id INTEGER PRIMARY KEY, nombre TEXT NOT NULL, activa INTEGER NOT NULL DEFAULT 1,
     modo TEXT NOT NULL DEFAULT 'semanal', dias TEXT NOT NULL DEFAULT '', fecha TEXT NOT NULL DEFAULT '',
@@ -180,6 +185,7 @@ def iniciar():
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0",
                                 "telegram": "TEXT NOT NULL DEFAULT ''"},
+                  "fotos": {"origen": "TEXT NOT NULL DEFAULT ''", "ext_url": "TEXT NOT NULL DEFAULT ''"},
                   "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''",
                               "en_fuente": "INTEGER NOT NULL DEFAULT 1"}}
         for tabla, cols in nuevas.items():
@@ -1508,6 +1514,7 @@ def programador():
         if ultima_lectura is None or time.monotonic() - ultima_lectura >= CADA_SINCRONIZAR:
             ultima_lectura = time.monotonic()
             sincronizar_seguro()
+            threading.Thread(target=importar_tandas_seguro, daemon=True, name="tandas").start()
         try:
             comprobar()
             if ultimo_limpiado != date.today():
@@ -2055,32 +2062,183 @@ def categoria_o_404(cat_id):
 def categoria(cat_id):
     cat = categoria_o_404(cat_id)
     lista = consulta("SELECT * FROM fotos WHERE categoria_id = ? ORDER BY id DESC", (cat_id,))
+    t = ESTADO["tandas"]
     return render_template("categoria.html", cat=cat, fotos=lista,
-                           subidas=request.args.get("subidas", type=int), malas=request.args.get("malas", type=int))
+                           subidas=request.args.get("subidas", type=int), malas=request.args.get("malas", type=int),
+                           es_tandas=cat_id == categoria_tandas(), tandas=t | {
+                               "ok": t["ok"].strftime("%d/%m %H:%M") if t["ok"] else ""})
 
 
 def miniatura(archivo):
     return Path(archivo).stem + ".jpg"
 
 
-def guardar_foto(cat_id, f):
-    """Guarda la foto ya girada y reducida, y su miniatura. False si no es una imagen válida."""
-    if Path(f.filename or "").suffix.lower() not in EXTENSIONES:
-        return False
+def guardar_imagen(stream, lado_max=LADO_MAX_FOTO):
+    """Guarda la foto ya girada y reducida, y su miniatura. Devuelve el archivo; excepción si no es una imagen."""
     archivo = f"{uuid.uuid4().hex}.jpg"
     try:
-        with Image.open(f.stream) as im:
-            im.draft("RGB", (LADO_MAX_FOTO, LADO_MAX_FOTO))  # JPEG grandes: decodifica ya reducido
+        with Image.open(stream) as im:
+            im.draft("RGB", (lado_max, lado_max))  # JPEG grandes: decodifica ya reducido
             im = ImageOps.exif_transpose(im).convert("RGB")
-            im.thumbnail((LADO_MAX_FOTO, LADO_MAX_FOTO), Image.LANCZOS)
+            im.thumbnail((lado_max, lado_max), Image.LANCZOS)
             im.save(DIR_FOTOS / archivo, "JPEG", quality=90)
             im.thumbnail((480, 480))
             im.save(DIR_MINIS / miniatura(archivo), "JPEG", quality=85)
     except Exception:
         (DIR_FOTOS / archivo).unlink(missing_ok=True)
+        raise
+    return archivo
+
+
+def guardar_foto(cat_id, f):
+    """Foto subida a mano. False si no es una imagen válida."""
+    if Path(f.filename or "").suffix.lower() not in EXTENSIONES:
+        return False
+    try:
+        archivo = guardar_imagen(f.stream)
+    except Exception:
         return False
     ejecutar("INSERT INTO fotos (categoria_id, archivo, subida) VALUES (?, ?, ?)", (cat_id, archivo, ahora_txt()))
     return True
+
+
+# --- Fotos de las tandas de CKS
+# CKS da solo las fotos de tandas de alquiler en las que TODOS los pilotos dieron permiso de imagen
+# (y ningún nombre). El panel las copia a una categoría y las borra cuando CKS deja de darlas:
+# pasada la semana, o si alguien retira el permiso.
+
+IMPORTAR = threading.Lock()
+
+
+def fotos_de_tandas(datos):
+    """Direcciones de las fotos en la respuesta de CKS: tandas[] con su lista de fotos."""
+    urls = []
+    for t in datos.get("tandas") or []:
+        if not isinstance(t, dict):
+            continue
+        fotos = t.get("fotos")
+        if not isinstance(fotos, list):  # por si la lista se llama de otra forma
+            fotos = next((v for v in t.values() if isinstance(v, list)), [])
+        for f in fotos:
+            if isinstance(f, dict):
+                f = next((v for k, v in f.items() if k in ("url", "direccion", "src") and isinstance(v, str)),
+                         next((v for v in f.values() if isinstance(v, str) and v.startswith("http")), None))
+            if isinstance(f, str) and f.startswith(("http://", "https://")) and f not in urls:
+                urls.append(f)
+    return urls
+
+
+def descargar_foto(url, cat_id):
+    datos = io.BytesIO()
+    with requests.get(url, timeout=60, stream=True) as r:
+        r.raise_for_status()
+        for trozo in r.iter_content(65536):
+            datos.write(trozo)
+            if datos.tell() > 50 * 1024 * 1024:
+                raise ValueError("foto demasiado grande")
+    datos.seek(0)
+    archivo = guardar_imagen(datos, LADO_MAX_TANDA)
+    ejecutar("INSERT INTO fotos (categoria_id, archivo, subida, origen, ext_url) VALUES (?, ?, ?, 'cks', ?)",
+             (cat_id, archivo, ahora_txt(), url))
+
+
+def categoria_tandas():
+    try:
+        cat_id = int(ajuste("tandas_categoria") or 0)
+    except ValueError:
+        return None
+    return cat_id if cat_id and consulta("SELECT 1 FROM categorias WHERE id = ?", (cat_id,)) else None
+
+
+def importar_tandas():
+    """Trae las fotos nuevas de las tandas y quita las que CKS ya no da. None si no está configurado."""
+    cat_id, estado = categoria_tandas(), ESTADO["tandas"]
+    if not (cat_id and ajuste("cks_url")):
+        estado.update(error="", total=None)
+        return None
+    if not IMPORTAR.acquire(blocking=False):  # ya se están trayendo
+        return None
+    try:
+        base = url_fuente("cks")
+        try:
+            r = requests.get(f"{base}/api/publico/fotos", params={"horas": HORAS_TANDAS},
+                             headers={"X-Token": ajuste("cks_token")}, timeout=30)
+        except requests.RequestException:
+            raise ErrorFuente(f"No hay conexión con {base}. Mira que CKS esté abierto y en la misma red.") from None
+        if r.status_code == 404:
+            raise ErrorFuente("CKS todavía no tiene la dirección de fotos (/api/publico/fotos).")
+        if r.status_code in (401, 403):
+            raise ErrorFuente("CKS no acepta el token (es el mismo que el de las competiciones).")
+        if r.status_code != 200:
+            raise ErrorFuente(f"CKS ha respondido con un error ({r.status_code}).")
+        try:
+            datos = r.json()
+        except ValueError:
+            datos = None
+        if not isinstance(datos, dict) or not isinstance(datos.get("tandas"), list):
+            raise ErrorFuente("La respuesta de fotos de CKS no tiene el formato esperado.")
+        urls = fotos_de_tandas(datos)
+        ya = {f["ext_url"]: f for f in consulta("SELECT * FROM fotos WHERE origen = 'cks'")}
+        nuevas = fallidas = 0
+        for url in urls:
+            if url in ya:
+                continue
+            try:
+                descargar_foto(url, cat_id)
+                nuevas += 1
+            except Exception as e:
+                fallidas += 1
+                log.warning("Foto de tanda %s: %s", url, e)
+        # Las que CKS ya no da (más de una semana, o alguien retiró el permiso) se borran.
+        # Si CKS no pudo mirar alguna tanda en la web, esta vez no se borra nada, por si acaso.
+        if not como_entero(datos.get("sin_conexion")):
+            for url, foto in ya.items():
+                if url not in urls:
+                    borrar_archivos_foto(foto)
+                    ejecutar("DELETE FROM fotos WHERE id = ?", (foto["id"],))
+        estado.update(ok=datetime.now(), nuevas=nuevas, total=len(urls),
+                      no_publicables=como_entero(datos.get("no_publicables")),
+                      error=f"{fallidas} foto(s) no se han podido bajar; se reintenta en 10 minutos." if fallidas else "")
+        return nuevas
+    except ErrorFuente as e:
+        estado["error"] = str(e)
+        raise
+    finally:
+        IMPORTAR.release()
+
+
+def importar_tandas_seguro():
+    try:
+        importar_tandas()
+    except ErrorFuente as e:
+        log.warning("Fotos de tandas: %s", e)
+    except Exception as e:
+        ESTADO["tandas"]["error"] = f"Error trayendo las fotos de las tandas: {e}"
+        log.exception("Fotos de tandas")
+
+
+def traer_tandas_ahora():
+    try:
+        n = importar_tandas()
+        if n is None:
+            flash("Las fotos de las tandas no están activadas (Ajustes → Racecore y CKS) o ya se están trayendo.", "error")
+        else:
+            t = ESTADO["tandas"]
+            flash(f"Fotos de tandas: {n} nueva(s); {t['total']} en total de la última semana"
+                  + (f"; {t['no_publicables']} tanda(s) sin permiso de imagen" if t["no_publicables"] else "")
+                  + (f". {t['error']}" if t["error"] else "."), "error" if t["error"] else "ok")
+    except ErrorFuente as e:
+        flash(f"Fotos de tandas: {e}", "error")
+    except Exception as e:
+        log.exception("Fotos de tandas")
+        flash(f"Error trayendo las fotos de las tandas: {e}", "error")
+
+
+@app.post("/fotos/tandas")
+def traer_tandas():
+    traer_tandas_ahora()
+    cat_id = categoria_tandas()
+    return redirect(url_for("categoria", cat_id=cat_id) if cat_id else url_for("fotos"))
 
 
 @app.post("/categorias/<int:cat_id>/subir")
@@ -2124,6 +2282,8 @@ def borrar_categoria(cat_id):
     ejecutar("DELETE FROM fotos WHERE categoria_id = ?", (cat_id,))
     ejecutar("UPDATE publicaciones SET categoria_id = NULL WHERE categoria_id = ?", (cat_id,))
     ejecutar("UPDATE eventos SET categoria_id = NULL WHERE categoria_id = ?", (cat_id,))
+    if categoria_tandas() == cat_id:
+        guardar_ajuste("tandas_categoria", "")
     ejecutar("DELETE FROM categorias WHERE id = ?", (cat_id,))
     flash("Categoría borrada.", "ok")
     return redirect(url_for("fotos"))
@@ -2139,6 +2299,13 @@ def ajustes():
         for f in FUENTES:
             guardar_ajuste(f"{f}_url", request.form.get(f"{f}_url", "").strip())
         guardar_ajuste("nombres_formato", "inicial" if request.form.get("nombres_formato") == "inicial" else "completo")
+        tandas_antes = categoria_tandas()
+        elegida = request.form.get("tandas_categoria", "")
+        if elegida == "nueva":
+            existe = consulta("SELECT id FROM categorias WHERE nombre = 'Tandas CKS'")
+            elegida = str(existe[0]["id"] if existe else
+                          ejecutar("INSERT INTO categorias (nombre) VALUES ('Tandas CKS')").lastrowid)
+        guardar_ajuste("tandas_categoria", elegida if elegida.isdigit() else "")
         for clave in ("openai_key", "telegram_token", *(f"{f}_token" for f in FUENTES)):
             nuevo = request.form.get(clave, "").strip()
             if request.form.get(f"quitar_{clave}"):
@@ -2156,6 +2323,8 @@ def ajustes():
             (ajuste(f"{f}_url"), ajuste(f"{f}_token")) != antes[f] or ajuste("nombres_formato", "completo") != formato_antes)]
         if cambiadas:
             leer_ahora(cambiadas)
+        if categoria_tandas() and (categoria_tandas() != tandas_antes or "cks" in cambiadas):
+            traer_tandas_ahora()
         return redirect(url_for("ajustes"))
 
     def oculta(clave):
@@ -2168,6 +2337,8 @@ def ajustes():
         conexiones=[f | {"url_ajuste": ajuste(f"{f['clave']}_url"), "token": oculta(f"{f['clave']}_token")}
                     for f in estado_fuentes()],
         nombres_formato=ajuste("nombres_formato", "completo"),
+        tandas_categoria=categoria_tandas(), categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
+        tandas=ESTADO["tandas"] | {"ok": ESTADO["tandas"]["ok"].strftime("%d/%m %H:%M") if ESTADO["tandas"]["ok"] else ""},
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
         ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
         marcas_v={t: int(r.stat().st_mtime) if r.exists() else 0 for t, (r, _) in MARCAS.items()},
@@ -2619,6 +2790,12 @@ PLANTILLAS["categoria.html"] = """{% extends "base.html" %}
 <h1>{{ cat.nombre }} <span class="ayuda">{{ fotos|length }} foto(s)</span></h1>
 {% if subidas %}<div class="mensaje">{{ subidas }} foto(s) subida(s).</div>{% endif %}
 {% if malas %}<div class="mensaje error">{{ malas }} archivo(s) no se pudieron subir: usa fotos JPG, PNG o WEBP.</div>{% endif %}
+{% if es_tandas %}<div class="caja">
+  <b>Fotos automáticas de las tandas de CKS</b>
+  <div class="ayuda">Llegan solas cada 10 minutos: solo tandas en las que todos los pilotos dieron permiso de imagen. Se borran solas a la semana.</div>
+  {% if tandas.error %}<div class="aviso">{{ tandas.error }}</div>{% elif tandas.ok %}<div class="ayuda">Última lectura {{ tandas.ok }}{% if tandas.no_publicables %} · {{ tandas.no_publicables }} tanda(s) sin permiso de imagen{% endif %}.</div>{% endif %}
+  <form method="post" action="{{ url_for('traer_tandas') }}" style="margin-top:8px"><button>Traer fotos ahora</button></form>
+</div>{% endif %}
 <form class="caja" id="subida" method="post" enctype="multipart/form-data" action="{{ url_for('subir_fotos', cat_id=cat.id) }}">
   <b>Subir fotos</b>
   <div class="ayuda">Puedes elegir muchas a la vez: se suben de una en una.</div>
@@ -2716,6 +2893,13 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
       {% if f.token %}<label style="color:var(--texto); margin-top:6px"><input type="checkbox" name="quitar_{{ f.clave }}_token" value="1"> Quitar el token</label>{% endif %}</div>
   </div>
   {% endfor %}
+  <label>Fotos de las tandas de alquiler (CKS)</label>
+  <select name="tandas_categoria">
+    <option value="">No traerlas</option>
+    {% if not tandas_categoria %}<option value="nueva">Traerlas a una categoría nueva: «Tandas CKS»</option>{% endif %}
+    {% for c in categorias %}<option value="{{ c.id }}" {{ 'selected' if c.id == tandas_categoria }}>Traerlas a la categoría «{{ c.nombre }}»</option>{% endfor %}
+  </select>
+  <div class="ayuda">Solo llegan fotos de tandas en las que <b>todos</b> los pilotos dieron permiso de imagen, y sin nombres. Se guardan una semana y se borran solas (también si alguien retira el permiso).</div>
   <label>Nombres de los pilotos en redes ({pilotos})</label>
   <select name="nombres_formato">
     <option value="completo" {{ 'selected' if nombres_formato != 'inicial' }}>Nombre y primer apellido (Ana Pérez)</option>
@@ -2761,6 +2945,9 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
     {% elif f.ok %}<span class="chip on">conectado</span> última lectura {{ f.ok }} · {{ f.n }} evento(s)
     {% else %}<span class="chip">pendiente</span>{% endif %}</div>
   {% endfor %}
+  {% if tandas_categoria %}<div>Fotos de tandas: {% if tandas.error %}<span class="chip error">aviso</span> <span class="ayuda">{{ tandas.error }}</span>
+    {% elif tandas.ok %}<span class="chip on">funcionando</span> última lectura {{ tandas.ok }} · {{ tandas.total }} foto(s) de la última semana{% if tandas.no_publicables %} · {{ tandas.no_publicables }} tanda(s) sin permiso{% endif %}
+    {% else %}<span class="chip">pendiente</span>{% endif %}</div>{% endif %}
   <div>Fuentes propias: {% if fuentes %}<span class="chip on">{{ fuentes|join(', ') }}</span>{% else %}<span class="chip">las incluidas</span> <span class="ayuda">opcional: Titulo.ttf y Texto.ttf en la carpeta «fuentes»</span>{% endif %}</div>
   <div class="ayuda" style="margin-top:8px">Carpeta del panel: {{ carpeta }}</div>
 </div>
