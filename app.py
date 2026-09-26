@@ -2177,6 +2177,32 @@ def subir_marca(tipo):
     return redirect(url_for("ajustes"))
 
 
+@app.post("/ajustes/telegram/detectar")
+def detectar_telegram():
+    """Busca el chat del último mensaje que le han mandado al bot y lo guarda como Chat ID."""
+    token = ajuste("telegram_token")
+    if not token:
+        flash("Primero pon el token del bot y guarda.", "error")
+        return redirect(url_for("ajustes"))
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates", timeout=20)
+        r.raise_for_status()
+        chats = [(u.get("message") or u.get("channel_post") or {}).get("chat") for u in r.json().get("result", [])]
+        chats = [c for c in chats if c and c.get("id")]
+    except Exception as e:
+        flash(f"Telegram ha fallado: {str(e).replace(token, '***')}", "error")
+        return redirect(url_for("ajustes"))
+    if not chats:
+        flash("No encuentro ningún mensaje: abre tu bot en Telegram, mándale «hola» y vuelve a pulsar el botón.",
+              "error")
+        return redirect(url_for("ajustes"))
+    chat = chats[-1]
+    guardar_ajuste("telegram_chat", str(chat["id"]))
+    nombre = chat.get("title") or " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x)
+    flash(f"Chat encontrado: {nombre or chat['id']}. Ahora pulsa «Probar Telegram».", "ok")
+    return redirect(url_for("ajustes"))
+
+
 @app.post("/ajustes/telegram")
 def probar_telegram():
     token, chat = ajuste("telegram_token"), ajuste("telegram_chat")
@@ -2649,7 +2675,8 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 </div>
 <div class="caja">
   <b>Telegram (opcional)</b>
-  <div class="ayuda">Si lo configuras, cada imagen programada te llega al móvil con su texto.</div>
+  <div class="ayuda">Si lo configuras, cada imagen programada te llega al móvil con su texto (las pruebas no).</div>
+  <div class="ayuda">1) En Telegram, habla con <b>@BotFather</b>: /newbot, ponle un nombre y copia el token aquí. 2) Guarda. 3) Abre tu bot, mándale «hola» y pulsa «Detectar mi chat». 4) «Probar Telegram».</div>
   <label>Token del bot {% if telegram_token %}<span class="chip on">{{ telegram_token }}</span>{% endif %}</label>
   <input type="password" name="telegram_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if telegram_token else '123456:ABC...' }}" autocomplete="off">
   {% if telegram_token %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_telegram_token" value="1"> Quitar el token</label>{% endif %}
@@ -2659,6 +2686,7 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
 <button class="principal">Guardar ajustes</button>
 </form>
 <div class="fila" style="margin-top:10px">
+  <form class="enlinea" method="post" action="{{ url_for('detectar_telegram') }}"><button>Detectar mi chat</button></form>
   <form class="enlinea" method="post" action="{{ url_for('probar_telegram') }}"><button>Probar Telegram</button></form>
   <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><input type="hidden" name="volver" value="ajustes"><button>Probar Racecore</button></form>
 </div>
