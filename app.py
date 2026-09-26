@@ -829,18 +829,17 @@ def calcular_horario(cfg, dias, eventos):
                 lineas.append(f"Evento: {ev['nombre']} · {hhmm(tramo[0])}-{hhmm(tramo[1])}")
             else:
                 lineas.append(f"Evento: {ev['nombre']}")
-        grupos = {}
-        for a in actividades:
+        abiertas = 0
+        for a in actividades:  # una por línea: en el cartel se leen mejor que agrupadas
             tramos = [(minutos(a.get("desde"), apertura), minutos(a.get("hasta"), cierre))]
             if a.get("evento", True):
                 for b in bloqueos:
                     tramos = restar(tramos, b)
             horas = " y ".join(f"{hhmm(x)}-{hhmm(y)}" for x, y in tramos if y - x >= 30)
             if horas:
-                grupos.setdefault(horas, []).append(txt(a["nombre"]))
-        for horas, quienes in grupos.items():
-            lineas.append(f"{unir(quienes)} · {horas}")
-        if not grupos and not bloqueos:
+                lineas.append(f"{txt(a['nombre'])} · {horas}")
+                abiertas += 1
+        if not abiertas and not bloqueos:
             lineas.append("Cerrado")
     return "\n".join(lineas), list(dict.fromkeys(nombres))
 
@@ -854,8 +853,10 @@ def con_horario(pub, occ):
     horario, nombres = calcular_horario(cfg, dias, consulta("SELECT * FROM eventos WHERE en_fuente = 1"))
     valores = {"{horario}": horario, "{dias_horario}": texto_dias(dias), "{eventos_horario}": unir(nombres)}
     datos = dict(pub)
-    if datos["diseno"] == "lista" and not datos["lista"].strip():
-        datos["lista"] = "{horario}"
+    if datos["diseno"] in ("cartel", "lista"):  # el horario siempre va en el centro del cartel
+        datos["diseno"] = "lista"
+        if not datos["lista"].strip():
+            datos["lista"] = "{horario}"
     for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
         for clave, valor in valores.items():
             datos[campo] = (datos[campo] or "").replace(clave, valor)
@@ -1008,7 +1009,7 @@ def leer_deportes(texto):
         cfg = json.loads(texto) if (texto or "").strip() else None
     except ValueError:
         cfg = None
-    if not isinstance(cfg, dict):
+    if not isinstance(cfg, dict) or not (cfg.get("f1") or cfg.get("motogp") or cfg.get("futbol")):
         return None
     cfg["apertura"] = leer_hora(cfg.get("apertura")) or "10:00"
     cfg["cierre"] = leer_hora(cfg.get("cierre")) or "20:00"
@@ -1068,8 +1069,10 @@ def con_deportes(pub, occ):
     dias = [occ.date() + timedelta(days=i) for i in range(cfg["dias"])]
     valores = {"{deportes}": texto_deportes(filas), "{dias_deportes}": texto_dias(dias)}
     datos = dict(pub)
-    if datos["diseno"] == "lista" and not datos["lista"].strip():
-        datos["lista"] = "{deportes}"
+    if datos["diseno"] in ("cartel", "lista"):  # los horarios siempre van en el centro del cartel
+        datos["diseno"] = "lista"
+        if not datos["lista"].strip():
+            datos["lista"] = "{deportes}"
     for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
         for clave, valor in valores.items():
             datos[campo] = (datos[campo] or "").replace(clave, valor)
@@ -2120,7 +2123,7 @@ def guardar_horario(f):
 
 def guardar_deportes(f):
     """Deportes en TV del formulario, en JSON (vacío si no se usa)."""
-    if not f.get("d_usar"):
+    if not f.get("d_usar") or not (f.get("d_f1") or f.get("d_motogp") or f.get("d_futbol")):
         return ""
     return json.dumps({"f1": bool(f.get("d_f1")), "motogp": bool(f.get("d_motogp")), "futbol": bool(f.get("d_futbol")),
                        "equipos": f.get("d_equipos", "").strip(), "canal": f.get("d_canal", "").strip(),
