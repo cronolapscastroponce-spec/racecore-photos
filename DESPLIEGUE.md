@@ -94,6 +94,24 @@ publicaciones de cada evento: recordatorios, horarios, inscritos, resultados…
 
 Si la IA falla, la publicación sale con la foto original y el aviso se ve en «Listas».
 
+## C2. Acceso desde el móvil o desde fuera (fácil): Tailscale
+
+Sin tocar el dominio ni el correo. Solo entran tus dispositivos.
+
+1. En el PC del panel: instala Tailscale (https://tailscale.com/download) y entra con tu
+   cuenta (Google, Microsoft…).
+2. En CMD **como administrador**: `tailscale serve --bg 5000`. La primera vez te da un enlace
+   para activar HTTPS: ábrelo y acepta. Al final te dice la dirección del panel, del tipo
+   `https://nombre-del-pc.xxxx.ts.net`.
+3. En el móvil: instala la app Tailscale y entra con **la misma cuenta**.
+4. Abre esa dirección en el móvil. Guárdala en la pantalla de inicio.
+   Como es HTTPS, el botón «Compartir» manda la imagen directamente a Instagram.
+
+El panel sigue escuchando solo en el propio PC: Tailscale hace de puente privado.
+Para quitarlo: `tailscale serve --https=443 off`.
+
+Si prefieres entrar desde cualquier navegador sin instalar nada, sigue con D, E y F (Cloudflare).
+
 ## D. Dominio en Cloudflare
 
 En CMD: `nslookup -type=ns midominio.com`
