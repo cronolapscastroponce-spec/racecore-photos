@@ -68,6 +68,10 @@ HORAS_TANDAS = 168                  # fotos de tandas de CKS: se guardan las de 
 MAX_TANDAS_CKS = 40                 # CKS da como mucho las 40 tandas más recientes
 LADO_MAX_TANDA = 2400               # (llegan a 1280-1920 px; así no se agrandan)
 MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
+# Plantilla de horario de apertura
+ACTIVIDADES = ["Kart Rental", "Entrenos Motos", "Entrenos Karting"]
+OCUPA = {"manana": "Mañana (hasta las {corte})", "todo": "Todo el día", "tarde": "Tarde (desde las {corte})",
+         "nada": "No ocupa la pista"}
 CONDICIONES = {"": "Siempre", "abierta": "Solo con la inscripción abierta", "plazas": "Solo si quedan plazas",
                "resultados": "Solo cuando haya resultados"}
 
@@ -104,7 +108,8 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     estilo_ia TEXT NOT NULL DEFAULT 'variado',
     momento TEXT NOT NULL DEFAULT 'antes', dias_desde INTEGER NOT NULL DEFAULT 14,
     dias_hasta INTEGER NOT NULL DEFAULT 3, cada INTEGER NOT NULL DEFAULT 2,
-    filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '', lista TEXT NOT NULL DEFAULT '');
+    filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '', lista TEXT NOT NULL DEFAULT '',
+    categorias_extra TEXT NOT NULL DEFAULT '', horario TEXT NOT NULL DEFAULT '');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
@@ -123,7 +128,7 @@ CREATE TABLE IF NOT EXISTS eventos (
     enlace TEXT NOT NULL DEFAULT '', web TEXT NOT NULL DEFAULT '', horarios TEXT NOT NULL DEFAULT '',
     resultados TEXT NOT NULL DEFAULT '', ganadores TEXT NOT NULL DEFAULT '', actualizado TEXT NOT NULL DEFAULT '',
     categoria_id INTEGER, pilotos TEXT NOT NULL DEFAULT '', en_fuente INTEGER NOT NULL DEFAULT 1,
-    UNIQUE (origen, ext_id));
+    ocupa TEXT NOT NULL DEFAULT 'manana', UNIQUE (origen, ext_id));
 """
 
 
@@ -182,14 +187,17 @@ def iniciar():
                                     "cada": "INTEGER NOT NULL DEFAULT 2",
                                     "filtro": "TEXT NOT NULL DEFAULT ''",
                                     "condicion": "TEXT NOT NULL DEFAULT ''",
-                                    "lista": "TEXT NOT NULL DEFAULT ''"},
+                                    "lista": "TEXT NOT NULL DEFAULT ''",
+                                    "categorias_extra": "TEXT NOT NULL DEFAULT ''",
+                                    "horario": "TEXT NOT NULL DEFAULT ''"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0",
                                 "telegram": "TEXT NOT NULL DEFAULT ''"},
                   "fotos": {"origen": "TEXT NOT NULL DEFAULT ''", "ext_url": "TEXT NOT NULL DEFAULT ''",
                             "ext_fecha": "TEXT NOT NULL DEFAULT ''"},
                   "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''",
-                              "en_fuente": "INTEGER NOT NULL DEFAULT 1"}}
+                              "en_fuente": "INTEGER NOT NULL DEFAULT 1",
+                              "ocupa": "TEXT NOT NULL DEFAULT 'manana'"}}
         for tabla, cols in nuevas.items():
             existentes = {f["name"] for f in c.execute(f"PRAGMA table_info({tabla})")}
             for col, tipo in cols.items():
@@ -698,7 +706,7 @@ def con_evento(pub, ev, occ):
             datos[campo] = (datos[campo] or "").replace(clave, valor or "")
     datos["nombre"] = f"{pub['nombre']} · {ev['nombre']}"
     if ev["categoria_id"]:  # fotos elegidas para este evento (motos, alquiler...)
-        datos["categoria_id"] = ev["categoria_id"]
+        datos["categoria_id"], datos["categorias_extra"] = ev["categoria_id"], ""
     datos["_aviso"] = ""
     if datos["diseno"] == "lista" and not datos["lista"].strip():
         datos["_aviso"] = "La lista de nombres está vacía: en Eventos mira si llegan los nombres de los inscritos. "
@@ -708,6 +716,132 @@ def con_evento(pub, ev, occ):
             datos["_aviso"] += (f"Ojo: datos de {FUENTES[ev['origen']]['nombre']} del {leido:%d/%m %H:%M} "
                                 "(no se han podido actualizar). "
                                 "Revisa los números antes de publicar.")
+    return datos
+
+
+# ---------------------------------------------------------------- horario de apertura
+# Plantilla para fines de semana, puentes y fiestas: qué hay abierto cada día y a qué horas.
+# Los eventos de esos días (Racecore, CKS o a mano) quitan las horas que ocupan la pista.
+
+def minutos(hhmm, defecto=None):
+    h = leer_hora(hhmm)
+    return int(h[:2]) * 60 + int(h[3:]) if h else defecto
+
+
+def hhmm(m):
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def unir(cosas):
+    """["a", "b", "c"] -> «a, b y c»"""
+    return " y ".join([", ".join(cosas[:-1]), cosas[-1]]) if len(cosas) > 1 else "".join(cosas)
+
+
+def leer_horario(texto):
+    """Configuración guardada (JSON) -> dict, o None si la publicación no usa horario."""
+    try:
+        cfg = json.loads(texto) if (texto or "").strip() else None
+    except ValueError:
+        cfg = None
+    if not isinstance(cfg, dict):
+        return None
+    cfg.setdefault("dias", "finde")
+    cfg["apertura"] = leer_hora(cfg.get("apertura")) or "10:00"
+    cfg["cierre"] = leer_hora(cfg.get("cierre")) or "20:00"
+    cfg["actividades"] = [a for a in cfg.get("actividades") or [] if isinstance(a, dict) and txt(a.get("nombre"))]
+    return cfg
+
+
+def dias_horario(cfg, occ):
+    """Los días que abarca: el fin de semana siguiente a la publicación o unas fechas (14 como mucho)."""
+    if cfg["dias"] == "fechas":
+        d1 = leer_fecha(cfg.get("desde"))
+        d2 = leer_fecha(cfg.get("hasta")) or d1
+        if not d1:
+            return []
+        d1, d2 = sorted((d1, d2))
+        return [d1 + timedelta(days=i) for i in range(min(14, (d2 - d1).days + 1))]
+    sabado = occ.date() + timedelta(days=(5 - occ.weekday()) % 7)
+    return [sabado, sabado + timedelta(days=1)]
+
+
+def texto_dias(dias):
+    """«sábado 11 y domingo 12 de octubre», «del 30 de abril al 3 de mayo»..."""
+    if not dias:
+        return ""
+    d1, d2 = dias[0], dias[-1]
+    if len(dias) == 1:
+        return f"{DIAS[d1.weekday()]} {d1.day} de {MESES[d1.month - 1]}"
+    if len(dias) == 2:
+        mes1 = "" if d1.month == d2.month else f" de {MESES[d1.month - 1]}"
+        return f"{DIAS[d1.weekday()]} {d1.day}{mes1} y {DIAS[d2.weekday()]} {d2.day} de {MESES[d2.month - 1]}"
+    mes1 = "" if d1.month == d2.month else f" de {MESES[d1.month - 1]}"
+    return f"del {d1.day}{mes1} al {d2.day} de {MESES[d2.month - 1]}"
+
+
+def restar(tramos, quitar):
+    """Quita el tramo «quitar» (min, min) de una lista de tramos."""
+    a, b = quitar
+    res = []
+    for x, y in tramos:
+        if b <= x or a >= y:
+            res.append((x, y))
+            continue
+        if x < a:
+            res.append((x, a))
+        if b < y:
+            res.append((b, y))
+    return res
+
+
+def calcular_horario(cfg, dias, eventos):
+    """(texto del horario, nombres de los eventos). Una línea «DÍA:» y debajo qué hay y a qué horas."""
+    apertura, cierre = minutos(cfg["apertura"]), minutos(cfg["cierre"])
+    corte = minutos(ajuste("corte_eventos", "16:00"), 16 * 60)
+    actividades = [a for a in cfg["actividades"] if a.get("activa")]
+    lineas, nombres = [], []
+    for dia in dias:
+        lineas.append(f"{DIAS[dia.weekday()]} {dia.day} de {MESES[dia.month - 1]}:".upper())
+        bloqueos = []
+        for ev in [e for e in eventos if leer_fecha(e["fecha"]) == dia]:
+            nombres.append(ev["nombre"])
+            tramo = {"manana": (apertura, corte), "todo": (apertura, cierre),
+                     "tarde": (corte, cierre)}.get(ev["ocupa"] or "manana")
+            if tramo and tramo[0] < tramo[1]:
+                bloqueos.append(tramo)
+                lineas.append(f"Evento: {ev['nombre']} · {hhmm(tramo[0])}-{hhmm(tramo[1])}")
+            else:
+                lineas.append(f"Evento: {ev['nombre']}")
+        grupos = {}
+        for a in actividades:
+            tramos = [(minutos(a.get("desde"), apertura), minutos(a.get("hasta"), cierre))]
+            if a.get("evento", True):
+                for b in bloqueos:
+                    tramos = restar(tramos, b)
+            horas = " y ".join(f"{hhmm(x)}-{hhmm(y)}" for x, y in tramos if y - x >= 30)
+            if horas:
+                grupos.setdefault(horas, []).append(txt(a["nombre"]))
+        for horas, quienes in grupos.items():
+            lineas.append(f"{unir(quienes)} · {horas}")
+        if not grupos and not bloqueos:
+            lineas.append("Cerrado")
+    return "\n".join(lineas), list(dict.fromkeys(nombres))
+
+
+def con_horario(pub, occ):
+    """La publicación con {horario}, {dias_horario} y {eventos_horario} ya puestos en sus textos."""
+    cfg = leer_horario(pub["horario"])
+    if not cfg:
+        return pub
+    dias = dias_horario(cfg, occ)
+    horario, nombres = calcular_horario(cfg, dias, consulta("SELECT * FROM eventos WHERE en_fuente = 1"))
+    valores = {"{horario}": horario, "{dias_horario}": texto_dias(dias), "{eventos_horario}": unir(nombres)}
+    datos = dict(pub)
+    if datos["diseno"] == "lista" and not datos["lista"].strip():
+        datos["lista"] = "{horario}"
+    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
+        for clave, valor in valores.items():
+            datos[campo] = (datos[campo] or "").replace(clave, valor)
     return datos
 
 
@@ -1334,16 +1468,23 @@ def elegir_foto(pub_id, fotos, evitar=None):
     return random.choice([f for f in fotos if f["id"] != evitar] or fotos)
 
 
+def ids_categorias(pub):
+    """La categoría de fotos de la publicación y las demás que se hayan marcado."""
+    ids = [pub["categoria_id"]] + [int(x) for x in (pub["categorias_extra"] or "").split(",") if x.strip().isdigit()]
+    return list(dict.fromkeys(i for i in ids if i))
+
+
 def componer(pub, occ, evitar=None, evitar_estilo=None):
     """(imagen, foto_id, con_ia, aviso, estilo)"""
     _, ancho, alto = FORMATOS.get(pub["formato"], FORMATOS["post"])
     avisos = []
-    fotos = consulta("SELECT * FROM fotos WHERE categoria_id = ?", (pub["categoria_id"],))
+    ids = ids_categorias(pub)
+    fotos = consulta(f"SELECT * FROM fotos WHERE categoria_id IN ({', '.join('?' for _ in ids)})", ids) if ids else []
     foto = elegir_foto(pub["id"], fotos, evitar)
     fondo, con_ia = None, False
 
     if foto is None:
-        avisos.append("La categoría no tiene fotos: se ha usado un fondo liso." if pub["categoria_id"]
+        avisos.append("Las categorías elegidas no tienen fotos: se ha usado un fondo liso." if ids
                       else "No has elegido categoría de fotos: se ha usado un fondo liso.")
         fondo = fondo_liso(ancho, alto, pub["color"])
     else:
@@ -1420,6 +1561,7 @@ def generar(gen_id, pub, occ, enviar=False):
         anterior = consulta("SELECT * FROM generadas WHERE id = ?", (gen_id,))
         if anterior:
             pub = con_version(pub, anterior[0])
+        pub = con_horario(pub, occ)
         img, foto_id, con_ia, aviso, estilo = componer(pub, occ, anterior[0]["foto_id"] if anterior else None,
                                                       (anterior[0]["estilo"] or None) if anterior else None)
         archivo = f"{pub['id']}_{occ:%Y%m%d_%H%M}_{gen_id}_{uuid.uuid4().hex[:6]}.jpg"
@@ -1658,7 +1800,16 @@ NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
          "diseno": "cartel", "estilo_ia": "variado",
          "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": "",
-         "lista": ""}
+         "lista": "", "categorias_extra": "", "horario": ""}
+# «+ Horario de apertura» en Publicaciones: una publicación ya preparada (en pausa)
+PLANTILLA_HORARIO = {
+    "nombre": "Horario del fin de semana", "activa": 0, "modo": "semanal", "dias": "3", "hora": "12:00",
+    "formato": "vertical", "diseno": "lista", "lista": "{horario}",
+    "titulo": "*HORARIO*", "subtitulo": "Fin de semana\n{dias_horario}", "pie": "",
+    "texto": "🏁 Horario de este fin de semana ({dias_horario}):\n\n{horario}\n\n¡Te esperamos en pista!",
+    "horario": json.dumps({"dias": "finde", "apertura": "10:00", "cierre": "20:00", "actividades": [
+        {"nombre": n, "activa": True, "desde": "", "hasta": "", "evento": True} for n in ACTIVIDADES]},
+        ensure_ascii=False)}
 
 
 @app.route("/publicaciones")
@@ -1672,7 +1823,7 @@ def publicaciones():
         genera = occ - timedelta(minutes=p["antelacion"]) if occ else None
         filas.append(dict(p) | {
             "programacion": resumen_programacion(p),
-            "categoria": cats.get(p["categoria_id"], "sin categoría"),
+            "categoria": " + ".join(cats.get(i, "?") for i in ids_categorias(p)) or "sin categoría",
             "formato_txt": FORMATOS.get(p["formato"], FORMATOS["post"])[0],
             "proxima": (cuando_txt(occ) + (f" · {ev['nombre']}" if ev else "")) if occ else "",
             "genera": genera.strftime("%d/%m %H:%M") if genera else "",
@@ -1686,6 +1837,24 @@ def guardar_filtro(f):
               "eventos": sorted({x.strip() for x in f.getlist("f_evento") if x.strip()}),
               "texto": f.get("f_texto", "").strip()}
     return json.dumps(filtro, ensure_ascii=False) if any(filtro.values()) else ""
+
+
+def guardar_horario(f):
+    """Horario de apertura del formulario, en JSON (vacío si no se usa)."""
+    if not f.get("h_usar"):
+        return ""
+    actividades = []
+    for i in range(len(ACTIVIDADES) + 1):
+        nombre = f.get(f"h_nombre_{i}", "").strip()
+        if nombre:
+            actividades.append({"nombre": nombre, "activa": bool(f.get(f"h_activa_{i}")),
+                                "desde": leer_hora(f.get(f"h_desde_{i}")), "hasta": leer_hora(f.get(f"h_hasta_{i}")),
+                                "evento": bool(f.get(f"h_evento_{i}"))})
+    return json.dumps({"dias": "fechas" if f.get("h_dias") == "fechas" else "finde",
+                       "desde": f.get("h_desde", "").strip(), "hasta": f.get("h_hasta", "").strip(),
+                       "apertura": leer_hora(f.get("h_apertura")) or "10:00",
+                       "cierre": leer_hora(f.get("h_cierre")) or "20:00", "actividades": actividades},
+                      ensure_ascii=False)
 
 
 def leer_formulario():
@@ -1740,6 +1909,9 @@ def leer_formulario():
         "cada": entero("cada", 1, 1, 60),
         "filtro": guardar_filtro(f),
         "condicion": f.get("condicion") if f.get("condicion") in CONDICIONES else "",
+        "categorias_extra": ",".join(sorted({x for x in f.getlist("categorias_extra") if x.isdigit()
+                                             and x != str(categoria_id)}, key=int)),
+        "horario": guardar_horario(f),
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
@@ -1757,6 +1929,8 @@ def editar_publicacion(pub_id=None):
     pub = dict(pub_o_404(pub_id)) if pub_id else dict(NUEVA)
     if not pub_id and request.args.get("modo") == "evento":
         pub["modo"] = "evento"
+    if not pub_id and request.args.get("plantilla") == "horario":
+        pub.update(PLANTILLA_HORARIO)
     if request.method == "POST":
         datos, errores = leer_formulario()
         if errores:
@@ -1784,8 +1958,22 @@ def editar_publicacion(pub_id=None):
                          key=str.casefold)
     sueltos = list(dict.fromkeys([e["nombre"] for e in todos if e["nombre"] and
                                   (leer_fecha(e["fecha"]) or desde) >= desde] + filtro["eventos"]))
+    # Horario de apertura: lo guardado, o lo normal (10 a 20 y las tres actividades) para empezar
+    horario = leer_horario(pub["horario"])
+    filas_h = list((horario or {}).get("actividades") or
+                   [{"nombre": n, "activa": True, "desde": "", "hasta": "", "evento": True} for n in ACTIVIDADES])
+    filas_h += [{"nombre": "", "activa": False, "desde": "", "hasta": "", "evento": True}] * \
+        (len(ACTIVIDADES) + 1 - len(filas_h))
+    vista = ""
+    if horario and pub.get("id") and pub["modo"] != "evento":  # cómo quedaría la próxima vez
+        occ = ocurrencia_prueba(pub_o_404(pub["id"]))
+        vista = calcular_horario(horario, dias_horario(horario, occ),
+                                 consulta("SELECT * FROM eventos WHERE en_fuente = 1"))[0]
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
                            filtro=filtro, campeonatos=campeonatos, sueltos=sueltos,
+                           horario=horario or {"dias": "finde", "apertura": "10:00", "cierre": "20:00"},
+                           usa_horario=bool(horario), filas_h=filas_h[:len(ACTIVIDADES) + 1], vista_horario=vista,
+                           extras={x for x in (pub["categorias_extra"] or "").split(",") if x},
                            eventos_filtro=[{"n": e["nombre"], "c": e["campeonato"]} for e in todos],
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
                            dias_marcados=set(str(pub["dias"]).split(",")), hay_ia=bool(ajuste("openai_key")),
@@ -1898,12 +2086,13 @@ def eventos():
     return render_template("eventos.html", eventos=filas, fuentes=estado_fuentes(), hay_reglas=hay_reglas,
                            nombres_fuente={f: d["nombre"] for f, d in FUENTES.items()},
                            hay_activas=bool(reglas), faltan_ejemplos=faltan,
+                           ocupa={k: v.format(corte=ajuste("corte_eventos", "16:00")) for k, v in OCUPA.items()},
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"))
 
 
 @app.post("/eventos/<int:ev_id>/fotos")
 def fotos_evento(ev_id):
-    """Categoría de fotos de un evento (vacío = la de cada publicación)."""
+    """Categoría de fotos de un evento (vacío = la de cada publicación) y lo que ocupa de la pista."""
     if not consulta("SELECT 1 FROM eventos WHERE id = ?", (ev_id,)):
         abort(404)
     try:
@@ -1912,8 +2101,9 @@ def fotos_evento(ev_id):
         cat_id = None
     if cat_id and not consulta("SELECT 1 FROM categorias WHERE id = ?", (cat_id,)):
         cat_id = None
-    ejecutar("UPDATE eventos SET categoria_id = ? WHERE id = ?", (cat_id, ev_id))
-    flash("Fotos del evento guardadas.", "ok")
+    ocupa = request.form.get("ocupa") if request.form.get("ocupa") in OCUPA else "manana"
+    ejecutar("UPDATE eventos SET categoria_id = ?, ocupa = ? WHERE id = ?", (cat_id, ocupa, ev_id))
+    flash("Evento guardado.", "ok")
     return redirect(url_for("eventos"))
 
 
@@ -2291,6 +2481,9 @@ def borrar_categoria(cat_id):
         borrar_archivos_foto(foto)
     ejecutar("DELETE FROM fotos WHERE categoria_id = ?", (cat_id,))
     ejecutar("UPDATE publicaciones SET categoria_id = NULL WHERE categoria_id = ?", (cat_id,))
+    for p in consulta("SELECT id, categorias_extra FROM publicaciones WHERE categorias_extra != ''"):
+        resto = ",".join(x for x in p["categorias_extra"].split(",") if x.strip() != str(cat_id))
+        ejecutar("UPDATE publicaciones SET categorias_extra = ? WHERE id = ?", (resto, p["id"]))
     ejecutar("UPDATE eventos SET categoria_id = NULL WHERE categoria_id = ?", (cat_id,))
     if categoria_tandas() == cat_id:
         guardar_ajuste("tandas_categoria", "")
@@ -2309,6 +2502,7 @@ def ajustes():
         for f in FUENTES:
             guardar_ajuste(f"{f}_url", request.form.get(f"{f}_url", "").strip())
         guardar_ajuste("nombres_formato", "inicial" if request.form.get("nombres_formato") == "inicial" else "completo")
+        guardar_ajuste("corte_eventos", leer_hora(request.form.get("corte_eventos")) or "16:00")
         tandas_antes = categoria_tandas()
         elegida = request.form.get("tandas_categoria", "")
         if elegida == "nueva":
@@ -2346,7 +2540,7 @@ def ajustes():
         "ajustes.html", openai_key=oculta("openai_key"), telegram_token=oculta("telegram_token"),
         conexiones=[f | {"url_ajuste": ajuste(f"{f['clave']}_url"), "token": oculta(f"{f['clave']}_token")}
                     for f in estado_fuentes()],
-        nombres_formato=ajuste("nombres_formato", "completo"),
+        nombres_formato=ajuste("nombres_formato", "completo"), corte_eventos=ajuste("corte_eventos", "16:00"),
         tandas_categoria=categoria_tandas(), categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
         tandas=ESTADO["tandas"] | {"ok": ESTADO["tandas"]["ok"].strftime("%d/%m %H:%M") if ESTADO["tandas"]["ok"] else ""},
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
@@ -2589,7 +2783,8 @@ if (navigator.canShare && navigator.canShare({ files: [new File([''], 'x.jpg', {
 PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
 {% block contenido %}
 <div class="fila" style="justify-content:space-between"><h1>Publicaciones</h1>
-<a class="boton principal" href="{{ url_for('editar_publicacion') }}">+ Nueva publicación</a></div>
+<div class="fila"><a class="boton" href="{{ url_for('editar_publicacion', plantilla='horario') }}">+ Horario de apertura</a>
+<a class="boton principal" href="{{ url_for('editar_publicacion') }}">+ Nueva publicación</a></div></div>
 {% for p in filas %}
 <div class="caja">
   <div class="fila" style="justify-content:space-between">
@@ -2597,6 +2792,7 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
       <b>{{ p.nombre }}</b>
       {% if p.activa %}<span class="chip on">Activa</span>{% else %}<span class="chip">Pausada</span>{% endif %}
       {% if p.modo == 'evento' %}<span class="chip">Eventos</span>{% endif %}
+      {% if p.horario %}<span class="chip">Horario</span>{% endif %}
       {% if p.prompt_ia %}<span class="chip ia">IA</span>{% endif %}
       <div class="ayuda">{{ p.programacion }} · {{ p.formato_txt }} · fotos: {{ p.categoria }}</div>
       {% if p.proxima %}<div class="ayuda">Próxima: <b>{{ p.proxima }}</b> (la imagen se prepara el {{ p.genera }})</div>
@@ -2622,6 +2818,10 @@ PLANTILLAS["publicacion.html"] = """{% extends "base.html" %}
 <style>
 .dos { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
 .tres { display:grid; grid-template-columns:1fr 1fr 1fr; gap:0 16px; }
+table.actividades { border-collapse:collapse; width:100%; min-width:520px; }
+table.actividades th { color:var(--suave); font-size:13px; font-weight:normal; text-align:left; padding:4px; }
+table.actividades td { padding:4px; }
+pre.vista { background:#0d0e10; border:1px solid var(--borde); border-radius:8px; padding:10px; white-space:pre-wrap; font:inherit; }
 @media (max-width:640px) { .dos { grid-template-columns:1fr; } }
 .dias label { display:inline-flex; gap:4px; align-items:center; margin:6px 10px 0 0; color:var(--texto); font-size:15px; }
 .opciones label { display:inline-flex; gap:6px; align-items:center; margin:6px 16px 0 0; color:var(--texto); font-size:15px; }
@@ -2687,6 +2887,11 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
     <div><label>Formato</label>
       <select name="formato">{% for clave, f in formatos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.formato }}>{{ f[0] }}</option>{% endfor %}</select></div>
   </div>
+  {% if categorias|length > 1 %}
+  <label>Y también fotos de (opcional)</label>
+  <div class="opciones">{% for c in categorias %}<label><input type="checkbox" name="categorias_extra" value="{{ c.id }}" {{ 'checked' if c.id|string in extras }}> {{ c.nombre }}</label>{% endfor %}</div>
+  <div class="ayuda">Cada vez coge una foto al azar de todas las categorías marcadas.</div>
+  {% endif %}
   <div class="dos">
     <div><label>Diseño</label>
       <select name="diseno">
@@ -2727,6 +2932,38 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 </div>
 
 <div class="caja">
+  <label style="color:var(--texto); margin:0"><input type="checkbox" name="h_usar" value="1" id="h_usar" {{ 'checked' if usa_horario }}> <b>Horario de apertura</b> <span class="ayuda">(fines de semana, puentes, fiestas…)</span></label>
+  <div id="caja_horario">
+    <div class="opciones">
+      <label><input type="radio" name="h_dias" value="finde" {{ 'checked' if horario.dias != 'fechas' }}> El fin de semana siguiente a la publicación (sábado y domingo)</label>
+      <label><input type="radio" name="h_dias" value="fechas" {{ 'checked' if horario.dias == 'fechas' }}> Estas fechas</label>
+    </div>
+    <div class="dos" id="h_fechas">
+      <div><label>Desde</label><input type="date" name="h_desde" value="{{ horario.desde or '' }}"></div>
+      <div><label>Hasta</label><input type="date" name="h_hasta" value="{{ horario.hasta or '' }}"></div>
+    </div>
+    <div class="dos">
+      <div><label>Apertura</label><input type="time" name="h_apertura" value="{{ horario.apertura }}"></div>
+      <div><label>Cierre</label><input type="time" name="h_cierre" value="{{ horario.cierre }}"></div>
+    </div>
+    <label>Qué hay abierto (deja las horas vacías para usar las de apertura y cierre)</label>
+    <div style="overflow-x:auto"><table class="actividades">
+      <tr><th></th><th>Actividad</th><th>Desde</th><th>Hasta</th><th title="Si hay un evento, se quitan sus horas">Se corta con eventos</th></tr>
+      {% for a in filas_h %}<tr>
+        <td><input type="checkbox" name="h_activa_{{ loop.index0 }}" value="1" {{ 'checked' if a.activa }}></td>
+        <td><input type="text" name="h_nombre_{{ loop.index0 }}" value="{{ a.nombre }}" placeholder="Otra actividad"></td>
+        <td><input type="time" name="h_desde_{{ loop.index0 }}" value="{{ a.desde or '' }}"></td>
+        <td><input type="time" name="h_hasta_{{ loop.index0 }}" value="{{ a.hasta or '' }}"></td>
+        <td style="text-align:center"><input type="checkbox" name="h_evento_{{ loop.index0 }}" value="1" {{ 'checked' if a.evento }}></td>
+      </tr>{% endfor %}
+    </table></div>
+    <div class="ayuda">Si esos días hay un evento (Racecore, CKS o a mano), se quitan las horas que ocupa. Lo que ocupa cada evento se elige en la pestaña <a href="{{ url_for('eventos') }}">Eventos</a> (normalmente, la mañana).</div>
+    <div class="ayuda">Variables: {horario} (el horario día a día; con el diseño «Cartel con lista» sale en el centro), {dias_horario} («sábado 11 y domingo 12 de octubre») y {eventos_horario}.</div>
+    {% if vista_horario %}<label>Así saldría la próxima vez</label><pre class="vista">{{ vista_horario }}</pre>{% endif %}
+  </div>
+</div>
+
+<div class="caja">
   <b>Texto del post</b>
   <textarea name="texto" style="min-height:140px" placeholder="El texto que pegarás en Instagram/Facebook">{{ pub.texto }}</textarea>
   <div class="ayuda" id="vars_normal">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00).</div>
@@ -2753,8 +2990,11 @@ function mostrarModo() {
   document.getElementById('vars_evento').hidden = m !== 'evento';
   document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
   document.getElementById('caja_lista').hidden = document.querySelector('select[name=diseno]').value !== 'lista';
+  document.getElementById('caja_horario').hidden = !document.getElementById('h_usar').checked;
+  document.getElementById('h_fechas').hidden = !document.querySelector('input[name=h_dias][value=fechas]').checked;
 }
-document.querySelectorAll('input[name=modo], select[name=momento], select[name=diseno]').forEach(r => r.addEventListener('change', mostrarModo));
+document.querySelectorAll('input[name=modo], select[name=momento], select[name=diseno], #h_usar, input[name=h_dias]')
+  .forEach(r => r.addEventListener('change', mostrarModo));
 // A qué eventos de ahora se aplica (igual que eventos_de() en el servidor)
 const EVENTOS = {{ eventos_filtro|tojson }};
 function aplica() {
@@ -2910,6 +3150,8 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
     {% for c in categorias %}<option value="{{ c.id }}" {{ 'selected' if c.id == tandas_categoria }}>Traerlas a la categoría «{{ c.nombre }}»</option>{% endfor %}
   </select>
   <div class="ayuda">Solo llegan fotos de tandas en las que <b>todos</b> los pilotos dieron permiso de imagen, y sin nombres. Se guardan una semana y se borran solas (también si alguien retira el permiso).</div>
+  <label>Los eventos «de mañana» ocupan la pista hasta las (para el horario de apertura)</label>
+  <input type="time" name="corte_eventos" value="{{ corte_eventos }}" style="max-width:160px">
   <label>Nombres de los pilotos en redes ({pilotos})</label>
   <select name="nombres_formato">
     <option value="completo" {{ 'selected' if nombres_formato != 'inicial' }}>Nombre y primer apellido (Ana Pérez)</option>
@@ -3011,6 +3253,10 @@ PLANTILLAS["eventos.html"] = """{% extends "base.html" %}
         <select name="categoria_id" onchange="this.form.submit()" style="width:auto">
           <option value="">las de cada publicación</option>
           {% for c in categorias %}<option value="{{ c.id }}" {{ 'selected' if c.id == ev.categoria_id }}>{{ c.nombre }}</option>{% endfor %}
+        </select>
+        <span class="ayuda">Ocupa la pista:</span>
+        <select name="ocupa" onchange="this.form.submit()" style="width:auto">
+          {% for clave, t in ocupa.items() %}<option value="{{ clave }}" {{ 'selected' if clave == (ev.ocupa or 'manana') }}>{{ t }}</option>{% endfor %}
         </select>
         <noscript><button>Guardar</button></noscript>
       </form>

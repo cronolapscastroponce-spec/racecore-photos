@@ -40,6 +40,19 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Marcar como publicada.
 - **Ajustes**: la clave de OpenAI y Telegram (opcional). El estado del programador.
 
+## B1. Horario de apertura (fines de semana, puentes, fiestas)
+
+1. **Publicaciones → + Horario de apertura**: sale una publicación ya preparada (en pausa).
+2. En **Horario de apertura** eliges los días («el fin de semana siguiente» o unas fechas),
+   la apertura y el cierre (10 a 20) y qué hay abierto: Kart Rental, Entrenos Motos,
+   Entrenos Karting (o las que escribas), cada una con sus horas si son distintas.
+3. Si esos días hay un evento (Racecore, CKS o a mano), se quitan las horas que ocupa.
+   En **Eventos** eliges para cada uno qué ocupa: mañana (hasta las 16:00, lo normal),
+   todo el día, tarde (desde las 16:00) o nada. La hora de corte se cambia en Ajustes.
+4. Variables: `{horario}`, `{dias_horario}` y `{eventos_horario}`. Con el diseño
+   «Cartel con lista» el horario sale en el centro de la imagen.
+5. En cualquier publicación puedes marcar **fotos de varias categorías**.
+
 ## B2. Eventos (Racecore y CKS)
 
 El panel lee los eventos de Racecore y de CKS por la red del circuito y prepara solas las
