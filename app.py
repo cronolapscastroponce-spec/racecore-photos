@@ -65,7 +65,8 @@ FUENTES = {
     "cks": {"nombre": "CKS", "ruta": "/api/publico/competiciones", "puerto": 8090},
 }
 HORAS_TANDAS = 168                  # fotos de tandas de CKS: se guardan las de la última semana
-LADO_MAX_TANDA = 2400               # y algo más pequeñas que las subidas a mano (llegan muchas)
+MAX_TANDAS_CKS = 40                 # CKS da como mucho las 40 tandas más recientes
+LADO_MAX_TANDA = 2400               # (llegan a 1280-1920 px; así no se agrandan)
 MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
 CONDICIONES = {"": "Siempre", "abierta": "Solo con la inscripción abierta", "plazas": "Solo si quedan plazas",
                "resultados": "Solo cuando haya resultados"}
@@ -91,7 +92,7 @@ CREATE TABLE IF NOT EXISTS categorias (
     id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS fotos (
     id INTEGER PRIMARY KEY, categoria_id INTEGER NOT NULL, archivo TEXT NOT NULL, subida TEXT NOT NULL,
-    origen TEXT NOT NULL DEFAULT '', ext_url TEXT NOT NULL DEFAULT '');
+    origen TEXT NOT NULL DEFAULT '', ext_url TEXT NOT NULL DEFAULT '', ext_fecha TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS publicaciones (
     id INTEGER PRIMARY KEY, nombre TEXT NOT NULL, activa INTEGER NOT NULL DEFAULT 1,
     modo TEXT NOT NULL DEFAULT 'semanal', dias TEXT NOT NULL DEFAULT '', fecha TEXT NOT NULL DEFAULT '',
@@ -185,7 +186,8 @@ def iniciar():
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0",
                                 "telegram": "TEXT NOT NULL DEFAULT ''"},
-                  "fotos": {"origen": "TEXT NOT NULL DEFAULT ''", "ext_url": "TEXT NOT NULL DEFAULT ''"},
+                  "fotos": {"origen": "TEXT NOT NULL DEFAULT ''", "ext_url": "TEXT NOT NULL DEFAULT ''",
+                            "ext_fecha": "TEXT NOT NULL DEFAULT ''"},
                   "eventos": {"categoria_id": "INTEGER", "pilotos": "TEXT NOT NULL DEFAULT ''",
                               "en_fuente": "INTEGER NOT NULL DEFAULT 1"}}
         for tabla, cols in nuevas.items():
@@ -2111,11 +2113,12 @@ IMPORTAR = threading.Lock()
 
 
 def fotos_de_tandas(datos):
-    """Direcciones de las fotos en la respuesta de CKS: tandas[] con su lista de fotos."""
-    urls = []
+    """{dirección: inicio de la tanda} de la respuesta de CKS: tandas[] {sesion_id, inicio, pilotos, fotos[]}."""
+    urls = {}
     for t in datos.get("tandas") or []:
         if not isinstance(t, dict):
             continue
+        inicio = txt(t.get("inicio")).replace("T", " ")[:19]  # «2026-09-27 17:30:12»
         fotos = t.get("fotos")
         if not isinstance(fotos, list):  # por si la lista se llama de otra forma
             fotos = next((v for v in t.values() if isinstance(v, list)), [])
@@ -2124,11 +2127,11 @@ def fotos_de_tandas(datos):
                 f = next((v for k, v in f.items() if k in ("url", "direccion", "src") and isinstance(v, str)),
                          next((v for v in f.values() if isinstance(v, str) and v.startswith("http")), None))
             if isinstance(f, str) and f.startswith(("http://", "https://")) and f not in urls:
-                urls.append(f)
+                urls[f] = inicio
     return urls
 
 
-def descargar_foto(url, cat_id):
+def descargar_foto(url, cat_id, fecha=""):
     datos = io.BytesIO()
     with requests.get(url, timeout=60, stream=True) as r:
         r.raise_for_status()
@@ -2138,8 +2141,8 @@ def descargar_foto(url, cat_id):
                 raise ValueError("foto demasiado grande")
     datos.seek(0)
     archivo = guardar_imagen(datos, LADO_MAX_TANDA)
-    ejecutar("INSERT INTO fotos (categoria_id, archivo, subida, origen, ext_url) VALUES (?, ?, ?, 'cks', ?)",
-             (cat_id, archivo, ahora_txt(), url))
+    ejecutar("INSERT INTO fotos (categoria_id, archivo, subida, origen, ext_url, ext_fecha) "
+             "VALUES (?, ?, ?, 'cks', ?, ?)", (cat_id, archivo, ahora_txt(), url, fecha))
 
 
 def categoria_tandas():
@@ -2180,20 +2183,27 @@ def importar_tandas():
         urls = fotos_de_tandas(datos)
         ya = {f["ext_url"]: f for f in consulta("SELECT * FROM fotos WHERE origen = 'cks'")}
         nuevas = fallidas = 0
-        for url in urls:
+        for url, fecha in urls.items():
             if url in ya:
                 continue
             try:
-                descargar_foto(url, cat_id)
+                descargar_foto(url, cat_id, fecha)
                 nuevas += 1
             except Exception as e:
                 fallidas += 1
                 log.warning("Foto de tanda %s: %s", url, e)
-        # Las que CKS ya no da (más de una semana, o alguien retiró el permiso) se borran.
+        # Las que CKS ya no da (más de una semana, permiso retirado o foto borrada) se borran.
         # Si CKS no pudo mirar alguna tanda en la web, esta vez no se borra nada, por si acaso.
+        # Si la lista viene cortada (40 tandas), las anteriores a la más antigua de la lista no
+        # se pueden comprobar: esas se borran al cumplir la semana.
+        cortada = len(datos["tandas"]) >= MAX_TANDAS_CKS
+        desde = min((f for f in urls.values() if f), default="") if cortada else ""
+        semana = (datetime.now() - timedelta(hours=HORAS_TANDAS)).strftime("%Y-%m-%d %H:%M:%S")
         if not como_entero(datos.get("sin_conexion")):
             for url, foto in ya.items():
-                if url not in urls:
+                fecha = foto["ext_fecha"]
+                comprobable = not cortada or not fecha or fecha >= desde
+                if url not in urls and (comprobable or fecha < semana):
                     borrar_archivos_foto(foto)
                     ejecutar("DELETE FROM fotos WHERE id = ?", (foto["id"],))
         estado.update(ok=datetime.now(), nuevas=nuevas, total=len(urls),
