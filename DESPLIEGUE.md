@@ -53,6 +53,18 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
    «Cartel con lista» el horario sale en el centro de la imagen.
 5. En cualquier publicación puedes marcar **fotos de varias categorías**.
 
+## B1b. Deportes en TV para la cafetería (F1, MotoGP, fútbol)
+
+- **Publicaciones → + F1 y MotoGP**: los jueves a las 12:00, con la clasificación, el sprint y
+  la carrera de jueves a domingo que caigan dentro del horario de la cafetería (10 a 20).
+- **Publicaciones → + Fútbol**: se revisa cada día a las 10:00 y **solo se publica si ese día**
+  juegan los equipos elegidos (Real Madrid, Barcelona) por el canal elegido (DAZN), sin las
+  competiciones excluidas (Liga F) y acabando antes del cierre (un partido son unas 2 horas).
+- Los horarios salen de Marca: los calendarios de F1 y MotoGP y su guía de TV (que solo trae
+  hoy y mañana). Si no hay nada que cumpla las condiciones, no se publica.
+- En Ajustes → Estado se ve la última lectura; si Marca cambia su página, sale un aviso.
+- Variables: `{deportes}` y `{dias_deportes}`.
+
 ## B2. Eventos (Racecore y CKS)
 
 El panel lee los eventos de Racecore y de CKS por la red del circuito y prepara solas las

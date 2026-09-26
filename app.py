@@ -70,6 +70,16 @@ LADO_MAX_TANDA = 2400               # (llegan a 1280-1920 px; así no se agranda
 MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
 # Plantilla de horario de apertura
 ACTIVIDADES = ["Kart Rental", "Entrenos Motos", "Entrenos Karting"]
+# Deportes en TV para la cafetería: calendarios y guía de TV de Marca (horas de España)
+MARCA = {
+    "f1": ("F1", "https://www.marca.com/motor/formula1/calendario.html", 12 * 3600),
+    "motogp": ("MotoGP", "https://www.marca.com/motor/motogp/calendario.html", 12 * 3600),
+    "tv": ("Guía de TV", "https://www.marca.com/programacion-tv.html", 2 * 3600),
+}
+# Lo que dura cada cosa, para saber si acaba antes de cerrar (minutos)
+DURACION = {("f1", "Carrera"): 120, ("f1", "Clasificación"): 60, ("f1", "Sprint"): 60,
+            ("f1", "Clasificación sprint"): 45, ("motogp", "Carrera"): 60, ("motogp", "Sprint"): 30,
+            ("motogp", "Clasificación"): 45, ("futbol", ""): 115}
 OCUPA = {"manana": "Mañana (hasta las {corte})", "todo": "Todo el día", "tarde": "Tarde (desde las {corte})",
          "nada": "No ocupa la pista"}
 CONDICIONES = {"": "Siempre", "abierta": "Solo con la inscripción abierta", "plazas": "Solo si quedan plazas",
@@ -85,7 +95,8 @@ AJUSTES_ENV = {
 
 log = logging.getLogger("racecore")
 ESTADO = {"ultima_comprobacion": None, "fuentes": {f: {"ok": None, "error": "", "n": None} for f in FUENTES},
-          "tandas": {"ok": None, "error": "", "nuevas": 0, "total": None, "no_publicables": None}}
+          "tandas": {"ok": None, "error": "", "nuevas": 0, "total": None, "no_publicables": None},
+          "deportes": {f: {"ok": None, "error": "", "n": None} for f in MARCA}}
 DIBUJO = threading.Lock()   # las fuentes de Pillow no se deben usar en dos hilos a la vez
 
 
@@ -109,7 +120,7 @@ CREATE TABLE IF NOT EXISTS publicaciones (
     momento TEXT NOT NULL DEFAULT 'antes', dias_desde INTEGER NOT NULL DEFAULT 14,
     dias_hasta INTEGER NOT NULL DEFAULT 3, cada INTEGER NOT NULL DEFAULT 2,
     filtro TEXT NOT NULL DEFAULT '', condicion TEXT NOT NULL DEFAULT '', lista TEXT NOT NULL DEFAULT '',
-    categorias_extra TEXT NOT NULL DEFAULT '', horario TEXT NOT NULL DEFAULT '');
+    categorias_extra TEXT NOT NULL DEFAULT '', horario TEXT NOT NULL DEFAULT '', deportes TEXT NOT NULL DEFAULT '');
 -- estado: generando | lista | publicada | descartada | error
 CREATE TABLE IF NOT EXISTS generadas (
     id INTEGER PRIMARY KEY, publicacion_id INTEGER NOT NULL, ocurrencia TEXT NOT NULL,
@@ -118,6 +129,11 @@ CREATE TABLE IF NOT EXISTS generadas (
     con_ia INTEGER NOT NULL DEFAULT 0, aviso TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL,
     estilo TEXT NOT NULL DEFAULT '', evento_id INTEGER NOT NULL DEFAULT 0, telegram TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
+-- Sesiones de F1 y MotoGP y emisiones de la guía de TV leídas de Marca
+CREATE TABLE IF NOT EXISTS emisiones (
+    id INTEGER PRIMARY KEY, fuente TEXT NOT NULL, fecha TEXT NOT NULL, hora TEXT NOT NULL,
+    deporte TEXT NOT NULL DEFAULT '', competicion TEXT NOT NULL DEFAULT '', titulo TEXT NOT NULL DEFAULT '',
+    sesion TEXT NOT NULL DEFAULT '', canal TEXT NOT NULL DEFAULT '');
 -- Eventos leídos de Racecore o CKS (origen 'racecore' o 'cks') o creados a mano ('manual').
 -- Solo lo necesario para las publicaciones: nada de datos personales salvo el podio.
 CREATE TABLE IF NOT EXISTS eventos (
@@ -189,7 +205,8 @@ def iniciar():
                                     "condicion": "TEXT NOT NULL DEFAULT ''",
                                     "lista": "TEXT NOT NULL DEFAULT ''",
                                     "categorias_extra": "TEXT NOT NULL DEFAULT ''",
-                                    "horario": "TEXT NOT NULL DEFAULT ''"},
+                                    "horario": "TEXT NOT NULL DEFAULT ''",
+                                    "deportes": "TEXT NOT NULL DEFAULT ''"},
                   "generadas": {"estilo": "TEXT NOT NULL DEFAULT ''",
                                 "evento_id": "INTEGER NOT NULL DEFAULT 0",
                                 "telegram": "TEXT NOT NULL DEFAULT ''"},
@@ -842,6 +859,229 @@ def con_horario(pub, occ):
     for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
         for clave, valor in valores.items():
             datos[campo] = (datos[campo] or "").replace(clave, valor)
+    return datos
+
+
+# ---------------------------------------------------------------- deportes en TV (cafetería)
+# Se leen de Marca: los calendarios de F1 y MotoGP (toda la temporada, con hora de España) y la
+# guía de TV (solo hoy y mañana, con el canal). Las publicaciones con «Deportes en TV» ponen en
+# {deportes} lo que cae dentro del horario de la cafetería; si no hay nada, no se publican.
+
+DEPORTES_LOCK = threading.Lock()
+
+
+def descargar_marca(url):
+    r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    r.raise_for_status()
+    m = re.search(rb'charset=["\']?([\w-]+)', r.content[:3000])
+    return r.content.decode(m.group(1).decode() if m else "iso-8859-15", errors="replace")
+
+
+def limpiar_html(trozo):
+    import html as html_mod
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_mod.unescape(trozo or ""))).strip()
+
+
+def tipo_sesion(nombre):
+    """«Clasificación carrera», «Parrilla», «Carrera al sprint»... -> nombre corto; None si son libres."""
+    n = nombre.lower()
+    if "libre" in n or "practice" in n or "entrenamiento" in n:
+        return None
+    if "sprint" in n:
+        return "Clasificación sprint" if "clasif" in n else "Sprint"
+    if "clasif" in n or "parrilla" in n:
+        return "Clasificación"
+    if n.startswith("carrera"):
+        return "Carrera"
+    return None
+
+
+def leer_calendario(texto, fuente):
+    """Sesiones de un calendario de Marca: [(fecha, hora, gran premio, circuito, sesión)]. En MotoGP, solo MotoGP."""
+    res = []
+    for bloque in re.split(r'<li class="gran-premio__element"', texto)[1:]:
+        titulo = re.search(r'gran-premio__title-item">(.*?)</span>', bloque, flags=re.S)
+        fecha_gp = re.search(r'gran-premio__date">\s*(\d{2})-(\d{2})-(\d{4})', bloque)
+        if not (titulo and fecha_gp):
+            continue
+        gp = limpiar_html(titulo.group(1)).rstrip(":").strip()
+        anio, mes_gp = int(fecha_gp.group(3)), int(fecha_gp.group(2))
+        circuito = re.search(r'gran-premio__circuit-name">(.*?)</h3>', bloque, flags=re.S)
+        if fuente == "motogp":  # Moto2 y Moto3 van en otros bloques
+            m = re.search(r'category-motogp">(.*?)(?=category-moto2|category-moto3|$)', bloque, flags=re.S)
+            bloque = m.group(1) if m else ""
+        for nombre, hora, dia, mes in re.findall(
+                r'gran-premio__schedule-data">(.*?)</span>\s*<span class="hora">\s*(\d{1,2}:\d{2})\s*</span>'
+                r'\s*<span class="fecha">\s*(\d{1,2})/(\d{1,2})', bloque, flags=re.S):
+            sesion = tipo_sesion(limpiar_html(nombre).rstrip(":"))
+            if not sesion:
+                continue
+            a = anio - 1 if int(mes) - mes_gp > 6 else anio
+            try:
+                res.append((date(a, int(mes), int(dia)).isoformat(), leer_hora(hora), gp,
+                            limpiar_html(circuito.group(1)) if circuito else "", sesion))
+            except ValueError:
+                continue
+    return res
+
+
+def leer_guia_tv(texto):
+    """Emisiones de la guía de TV de Marca: [(fecha, hora, deporte, competición, título, canal)]."""
+    res = []
+    for bloque in re.split(r'<span class="title-section-widget">', texto)[1:]:
+        cabecera = re.match(r'(.*?)</span>', bloque, flags=re.S)
+        dia = leer_fecha(limpiar_html(cabecera.group(1)).lower()) if cabecera else None
+        if not dia:
+            continue
+        for ev in re.findall(r'<li class="dailyevent">(.*?)</li>', bloque, flags=re.S):
+            campo = lambda cls: limpiar_html((re.search(  # noqa: E731
+                rf'class="{cls}"[^>]*>(.*?)</(?:span|strong|h4)>', ev, flags=re.S) or [None, ""])[1])
+            hora = leer_hora(campo("dailyhour"))
+            if hora:
+                res.append((dia.isoformat(), hora, campo("dailyday"), campo("dailycompetition"),
+                            campo("dailyteams"), campo("dailychannel")))
+    return res
+
+
+def actualizar_deportes(fuentes=None, forzar=False):
+    """Lee de Marca lo que haga falta (cada fuente tiene su plazo). Devuelve {fuente: nº de filas}."""
+    hechas = {}
+    with DEPORTES_LOCK:
+        for fuente in fuentes or MARCA:
+            nombre, url, cada = MARCA[fuente]
+            estado = ESTADO["deportes"][fuente]
+            ultima = ajuste(f"marca_{fuente}")
+            if not forzar and ultima and (datetime.now() - datetime.strptime(ultima, "%Y-%m-%d %H:%M:%S")
+                                          ).total_seconds() < cada:
+                continue
+            try:
+                texto = descargar_marca(url)
+                filas = leer_guia_tv(texto) if fuente == "tv" else leer_calendario(texto, fuente)
+                if not filas:
+                    raise ErrorFuente(f"No encuentro nada en la página de {nombre}: puede que Marca la haya cambiado.")
+            except ErrorFuente as e:
+                estado["error"] = str(e)
+                log.warning("Marca %s: %s", fuente, e)
+                continue
+            except Exception as e:
+                estado["error"] = f"No se ha podido leer {nombre} de Marca ({str(e)[:150]})."
+                log.warning("Marca %s: %s", fuente, e)
+                continue
+            c = conectar()
+            try:
+                if fuente == "tv":  # la guía solo trae hoy y mañana: se sustituyen esos días
+                    for dia in {f[0] for f in filas}:
+                        c.execute("DELETE FROM emisiones WHERE fuente = 'tv' AND fecha = ?", (dia,))
+                    c.executemany("INSERT INTO emisiones (fuente, fecha, hora, deporte, competicion, titulo, canal) "
+                                  "VALUES ('tv', ?, ?, ?, ?, ?, ?)", filas)
+                else:
+                    c.execute("DELETE FROM emisiones WHERE fuente = ?", (fuente,))
+                    # (fecha, hora, gran premio, circuito, sesión)
+                    c.executemany("INSERT INTO emisiones (fuente, fecha, hora, titulo, competicion, sesion) "
+                                  "VALUES (?, ?, ?, ?, ?, ?)", [(fuente, *f) for f in filas])
+                limite = (date.today() - timedelta(days=30)).isoformat()
+                c.execute("DELETE FROM emisiones WHERE fecha < ?", (limite,))
+                c.commit()
+            finally:
+                c.close()
+            guardar_ajuste(f"marca_{fuente}", ahora_txt())
+            estado.update(ok=datetime.now(), error="", n=len(filas))
+            hechas[fuente] = len(filas)
+    return hechas
+
+
+def actualizar_deportes_seguro():
+    """Para el programador: solo si alguna publicación activa usa deportes."""
+    usadas = set()
+    for p in consulta("SELECT deportes FROM publicaciones WHERE activa = 1 AND deportes != ''"):
+        cfg = leer_deportes(p["deportes"])
+        usadas |= {f for f in ("f1", "motogp") if cfg and cfg.get(f)} | ({"tv"} if cfg and cfg.get("futbol") else set())
+    if usadas:
+        try:
+            actualizar_deportes(sorted(usadas))
+        except Exception:
+            log.exception("Deportes")
+
+
+def leer_deportes(texto):
+    try:
+        cfg = json.loads(texto) if (texto or "").strip() else None
+    except ValueError:
+        cfg = None
+    if not isinstance(cfg, dict):
+        return None
+    cfg["apertura"] = leer_hora(cfg.get("apertura")) or "10:00"
+    cfg["cierre"] = leer_hora(cfg.get("cierre")) or "20:00"
+    cfg["dias"] = min(14, max(1, como_entero(cfg.get("dias")) or 1))
+    return cfg
+
+
+def lista_deportes(cfg, occ):
+    """[(fecha, hora, línea)] de lo que cae dentro del horario de la cafetería en los días de la publicación."""
+    desde = occ.date()
+    dias = [(desde + timedelta(days=i)).isoformat() for i in range(cfg["dias"])]
+    apertura, cierre = minutos(cfg["apertura"]), minutos(cfg["cierre"])
+    marca = ",".join("?" for _ in dias)
+    res = []
+
+    def cabe(hora, dura):
+        m = minutos(hora)
+        return m is not None and m >= apertura and m + dura <= cierre
+    for fuente in ("f1", "motogp"):
+        if not cfg.get(fuente):
+            continue
+        for e in consulta(f"SELECT * FROM emisiones WHERE fuente = ? AND fecha IN ({marca}) ORDER BY fecha, hora",
+                          [fuente, *dias]):
+            if cabe(e["hora"], DURACION.get((fuente, e["sesion"]), 60)):
+                res.append((e["fecha"], e["hora"], f"{e['hora']} · {MARCA[fuente][0]} {e['titulo']} · {e['sesion']}"))
+    if cfg.get("futbol"):
+        equipos = {x.strip().casefold() for x in (cfg.get("equipos") or "").split(",") if x.strip()}
+        canal = (cfg.get("canal") or "").strip().casefold()
+        fuera = [x.strip().casefold() for x in (cfg.get("excluir") or "").split(",") if x.strip()]
+        for e in consulta(f"SELECT * FROM emisiones WHERE fuente = 'tv' AND fecha IN ({marca}) ORDER BY fecha, hora",
+                          dias):
+            lados = {x.strip().casefold() for x in e["titulo"].split(" - ")}
+            if (e["deporte"].casefold() == "fútbol" and lados & equipos and canal in e["canal"].casefold()
+                    and not any(x in e["competicion"].casefold() for x in fuera)
+                    and cabe(e["hora"], DURACION[("futbol", "")])):
+                res.append((e["fecha"], e["hora"], f"{e['hora']} · {e['titulo']} · {e['canal']}"))
+    return sorted(res)
+
+
+def texto_deportes(filas):
+    lineas, dia = [], None
+    for fecha, _, linea in filas:
+        if fecha != dia:
+            dia = fecha
+            d = date.fromisoformat(fecha)
+            lineas.append(f"{DIAS[d.weekday()]} {d.day} de {MESES[d.month - 1]}:".upper())
+        lineas.append(linea)
+    return "\n".join(lineas)
+
+
+def con_deportes(pub, occ):
+    """La publicación con {deportes} y {dias_deportes}. _vacia = no hay nada que publicar."""
+    cfg = leer_deportes(pub["deportes"])
+    if not cfg:
+        return pub
+    filas = lista_deportes(cfg, occ)
+    dias = [occ.date() + timedelta(days=i) for i in range(cfg["dias"])]
+    valores = {"{deportes}": texto_deportes(filas), "{dias_deportes}": texto_dias(dias)}
+    datos = dict(pub)
+    if datos["diseno"] == "lista" and not datos["lista"].strip():
+        datos["lista"] = "{deportes}"
+    for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
+        for clave, valor in valores.items():
+            datos[campo] = (datos[campo] or "").replace(clave, valor)
+    datos["_vacia"] = not filas
+    if not filas:
+        datos["_aviso"] = ((datos.get("_aviso") or "") + " No hay nada de deportes que cumpla las condiciones "
+                           "(por eso no se publica sola).").strip()
+    else:
+        viejas = [MARCA[f][0] for f in MARCA if ESTADO["deportes"][f]["error"]]
+        if viejas:
+            datos["_aviso"] = ((datos.get("_aviso") or "") + f" Ojo: no se ha podido actualizar {unir(viejas)} "
+                               "desde Marca; revisa los horarios.").strip()
     return datos
 
 
@@ -1561,7 +1801,7 @@ def generar(gen_id, pub, occ, enviar=False):
         anterior = consulta("SELECT * FROM generadas WHERE id = ?", (gen_id,))
         if anterior:
             pub = con_version(pub, anterior[0])
-        pub = con_horario(pub, occ)
+        pub = con_deportes(con_horario(pub, occ), occ)
         img, foto_id, con_ia, aviso, estilo = componer(pub, occ, anterior[0]["foto_id"] if anterior else None,
                                                       (anterior[0]["estilo"] or None) if anterior else None)
         archivo = f"{pub['id']}_{occ:%Y%m%d_%H%M}_{gen_id}_{uuid.uuid4().hex[:6]}.jpg"
@@ -1638,6 +1878,11 @@ def comprobar(ahora=None):
             continue
         for occ in ocurrencias(pub, ahora - GRACIA, ahora + antelacion):
             if occ > ahora - GRACIA:
+                # Deportes: si ese día no hay nada que ver en la cafetería, no se publica (se vuelve a mirar)
+                if pub["deportes"]:
+                    datos = con_deportes(pub, occ)
+                    if isinstance(datos, dict) and datos.get("_vacia"):
+                        continue
                 gen_id = reclamar(pub["id"], occ, prueba=False)
                 if gen_id:
                     generar(gen_id, pub, occ, enviar=True)
@@ -1659,6 +1904,7 @@ def programador():
             ultima_lectura = time.monotonic()
             sincronizar_seguro()
             threading.Thread(target=importar_tandas_seguro, daemon=True, name="tandas").start()
+            threading.Thread(target=actualizar_deportes_seguro, daemon=True, name="deportes").start()
         try:
             comprobar()
             if ultimo_limpiado != date.today():
@@ -1800,7 +2046,22 @@ NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "
          "titulo": "", "subtitulo": "", "pie": "", "texto": "", "color": "#e8195a", "prompt_ia": "",
          "diseno": "cartel", "estilo_ia": "variado",
          "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": "",
-         "lista": "", "categorias_extra": "", "horario": ""}
+         "lista": "", "categorias_extra": "", "horario": "", "deportes": ""}
+DEPORTES_NUEVA = {"f1": False, "motogp": False, "futbol": False, "equipos": "Real Madrid, Barcelona",
+                  "canal": "DAZN", "excluir": "Liga F", "dias": 4, "apertura": "10:00", "cierre": "20:00"}
+PLANTILLAS_DEPORTES = {
+    "motor": {"nombre": "F1 y MotoGP en la cafetería", "activa": 0, "modo": "semanal", "dias": "3", "hora": "12:00",
+              "formato": "vertical", "diseno": "lista", "lista": "{deportes}",
+              "titulo": "ESTE FINDE\n*EN DIRECTO*", "subtitulo": "F1 y MotoGP\nen nuestra cafetería", "pie": "",
+              "texto": "🏎️🏍️ Este fin de semana vive la F1 y MotoGP en la cafetería del circuito:\n\n{deportes}"
+                       "\n\n¡Te esperamos!",
+              "deportes": json.dumps(DEPORTES_NUEVA | {"f1": True, "motogp": True, "dias": 4}, ensure_ascii=False)},
+    "futbol": {"nombre": "Fútbol en la cafetería", "activa": 0, "modo": "semanal", "dias": "0,1,2,3,4,5,6",
+               "hora": "10:00", "formato": "vertical", "diseno": "lista", "lista": "{deportes}",
+               "titulo": "HOY\n*FÚTBOL*", "subtitulo": "En directo\nen la cafetería", "pie": "",
+               "texto": "⚽ Hoy en la cafetería:\n\n{deportes}\n\n¡Ven a verlo con nosotros!",
+               "deportes": json.dumps(DEPORTES_NUEVA | {"futbol": True, "dias": 1}, ensure_ascii=False)},
+}
 # «+ Horario de apertura» en Publicaciones: una publicación ya preparada (en pausa)
 PLANTILLA_HORARIO = {
     "nombre": "Horario del fin de semana", "activa": 0, "modo": "semanal", "dias": "3", "hora": "12:00",
@@ -1855,6 +2116,18 @@ def guardar_horario(f):
                        "apertura": leer_hora(f.get("h_apertura")) or "10:00",
                        "cierre": leer_hora(f.get("h_cierre")) or "20:00", "actividades": actividades},
                       ensure_ascii=False)
+
+
+def guardar_deportes(f):
+    """Deportes en TV del formulario, en JSON (vacío si no se usa)."""
+    if not f.get("d_usar"):
+        return ""
+    return json.dumps({"f1": bool(f.get("d_f1")), "motogp": bool(f.get("d_motogp")), "futbol": bool(f.get("d_futbol")),
+                       "equipos": f.get("d_equipos", "").strip(), "canal": f.get("d_canal", "").strip(),
+                       "excluir": f.get("d_excluir", "").strip(),
+                       "dias": min(14, max(1, como_entero(f.get("d_dias")) or 1)),
+                       "apertura": leer_hora(f.get("d_apertura")) or "10:00",
+                       "cierre": leer_hora(f.get("d_cierre")) or "20:00"}, ensure_ascii=False)
 
 
 def leer_formulario():
@@ -1912,6 +2185,7 @@ def leer_formulario():
         "categorias_extra": ",".join(sorted({x for x in f.getlist("categorias_extra") if x.isdigit()
                                              and x != str(categoria_id)}, key=int)),
         "horario": guardar_horario(f),
+        "deportes": guardar_deportes(f),
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
@@ -1931,6 +2205,8 @@ def editar_publicacion(pub_id=None):
         pub["modo"] = "evento"
     if not pub_id and request.args.get("plantilla") == "horario":
         pub.update(PLANTILLA_HORARIO)
+    if not pub_id and request.args.get("plantilla") in PLANTILLAS_DEPORTES:
+        pub.update(PLANTILLAS_DEPORTES[request.args["plantilla"]])
     if request.method == "POST":
         datos, errores = leer_formulario()
         if errores:
@@ -1969,8 +2245,15 @@ def editar_publicacion(pub_id=None):
         occ = ocurrencia_prueba(pub_o_404(pub["id"]))
         vista = calcular_horario(horario, dias_horario(horario, occ),
                                  consulta("SELECT * FROM eventos WHERE en_fuente = 1"))[0]
+    deportes = leer_deportes(pub["deportes"])
+    vista_dep = ""
+    if deportes and pub.get("id") and pub["modo"] != "evento":
+        occ = ocurrencia_prueba(pub_o_404(pub["id"]))
+        vista_dep = texto_deportes(lista_deportes(deportes, occ)) or \
+            f"Nada que cumpla las condiciones para el {cuando_txt(occ)}: ese día no se publica."
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
                            filtro=filtro, campeonatos=campeonatos, sueltos=sueltos,
+                           deportes=deportes or DEPORTES_NUEVA, usa_deportes=bool(deportes), vista_deportes=vista_dep,
                            horario=horario or {"dias": "finde", "apertura": "10:00", "cierre": "20:00"},
                            usa_horario=bool(horario), filas_h=filas_h[:len(ACTIVIDADES) + 1], vista_horario=vista,
                            extras={x for x in (pub["categorias_extra"] or "").split(",") if x},
@@ -2542,6 +2825,9 @@ def ajustes():
                     for f in estado_fuentes()],
         nombres_formato=ajuste("nombres_formato", "completo"), corte_eventos=ajuste("corte_eventos", "16:00"),
         tandas_categoria=categoria_tandas(), categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
+        deportes=[{"nombre": MARCA[f][0], "error": ESTADO["deportes"][f]["error"], "n": ESTADO["deportes"][f]["n"],
+                   "ok": ajuste(f"marca_{f}")[8:10] + "/" + ajuste(f"marca_{f}")[5:7] + " " + ajuste(f"marca_{f}")[11:16]
+                   if ajuste(f"marca_{f}") else ""} for f in MARCA],
         tandas=ESTADO["tandas"] | {"ok": ESTADO["tandas"]["ok"].strftime("%d/%m %H:%M") if ESTADO["tandas"]["ok"] else ""},
         telegram_chat=ajuste("telegram_chat"), calidad=ajuste("openai_calidad", "medium"),
         ultima=ultima.strftime("%H:%M:%S") if ultima else "", carpeta=BASE,
@@ -2604,6 +2890,17 @@ def subir_marca(tipo):
         flash(f"{nombre}: guardado, pero no tiene fondo transparente y se verá como un recuadro. "
               "Mejor un PNG sin fondo.", "error")
     return redirect(url_for("ajustes"))
+
+
+@app.post("/deportes/actualizar")
+def actualizar_deportes_ahora():
+    hechas = actualizar_deportes(forzar=True)
+    errores = [f"{MARCA[f][0]}: {ESTADO['deportes'][f]['error']}" for f in MARCA if f not in hechas]
+    if hechas:
+        flash("Marca: " + ", ".join(f"{MARCA[f][0]} {n}" for f, n in hechas.items()) + " leídos.", "ok")
+    for e in errores:
+        flash(e, "error")
+    return redirect(request.referrer or url_for("ajustes"))
 
 
 @app.post("/ajustes/telegram/detectar")
@@ -2784,6 +3081,8 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
 {% block contenido %}
 <div class="fila" style="justify-content:space-between"><h1>Publicaciones</h1>
 <div class="fila"><a class="boton" href="{{ url_for('editar_publicacion', plantilla='horario') }}">+ Horario de apertura</a>
+<a class="boton" href="{{ url_for('editar_publicacion', plantilla='motor') }}">+ F1 y MotoGP</a>
+<a class="boton" href="{{ url_for('editar_publicacion', plantilla='futbol') }}">+ Fútbol</a>
 <a class="boton principal" href="{{ url_for('editar_publicacion') }}">+ Nueva publicación</a></div></div>
 {% for p in filas %}
 <div class="caja">
@@ -2793,6 +3092,7 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
       {% if p.activa %}<span class="chip on">Activa</span>{% else %}<span class="chip">Pausada</span>{% endif %}
       {% if p.modo == 'evento' %}<span class="chip">Eventos</span>{% endif %}
       {% if p.horario %}<span class="chip">Horario</span>{% endif %}
+      {% if p.deportes %}<span class="chip">Deportes</span>{% endif %}
       {% if p.prompt_ia %}<span class="chip ia">IA</span>{% endif %}
       <div class="ayuda">{{ p.programacion }} · {{ p.formato_txt }} · fotos: {{ p.categoria }}</div>
       {% if p.proxima %}<div class="ayuda">Próxima: <b>{{ p.proxima }}</b> (la imagen se prepara el {{ p.genera }})</div>
@@ -2964,6 +3264,31 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 </div>
 
 <div class="caja">
+  <label style="color:var(--texto); margin:0"><input type="checkbox" name="d_usar" value="1" id="d_usar" {{ 'checked' if usa_deportes }}> <b>Deportes en TV para la cafetería</b> <span class="ayuda">(horarios de Marca)</span></label>
+  <div id="caja_deportes">
+    <div class="opciones">
+      <label><input type="checkbox" name="d_f1" value="1" {{ 'checked' if deportes.f1 }}> F1</label>
+      <label><input type="checkbox" name="d_motogp" value="1" {{ 'checked' if deportes.motogp }}> MotoGP</label>
+      <label><input type="checkbox" name="d_futbol" value="1" {{ 'checked' if deportes.futbol }}> Fútbol</label>
+    </div>
+    <div class="ayuda">De la F1 y MotoGP salen la clasificación, el sprint y la carrera (sin libres).</div>
+    <div class="tres">
+      <div><label>Equipos (fútbol)</label><input type="text" name="d_equipos" value="{{ deportes.equipos }}"></div>
+      <div><label>Solo si lo da el canal</label><input type="text" name="d_canal" value="{{ deportes.canal }}" placeholder="Vacío = cualquiera"></div>
+      <div><label>Sin estas competiciones</label><input type="text" name="d_excluir" value="{{ deportes.excluir }}" placeholder="Ej: Liga F"></div>
+    </div>
+    <div class="tres">
+      <div><label>Días (desde el de la publicación)</label><input type="number" name="d_dias" min="1" max="14" value="{{ deportes.dias }}"></div>
+      <div><label>Abre la cafetería</label><input type="time" name="d_apertura" value="{{ deportes.apertura }}"></div>
+      <div><label>Cierra</label><input type="time" name="d_cierre" value="{{ deportes.cierre }}"></div>
+    </div>
+    <div class="ayuda">Solo sale lo que empieza después de abrir y acaba antes de cerrar (un partido dura unas 2 horas). Si no hay nada, ese día no se publica. La guía de TV de Marca solo trae hoy y mañana: para el fútbol, publica el mismo día (con antelación de un día como mucho).</div>
+    <div class="ayuda">Variables: {deportes} (con «Cartel con lista» sale en el centro) y {dias_deportes}.</div>
+    {% if vista_deportes %}<label>Así saldría la próxima vez</label><pre class="vista">{{ vista_deportes }}</pre>{% endif %}
+  </div>
+</div>
+
+<div class="caja">
   <b>Texto del post</b>
   <textarea name="texto" style="min-height:140px" placeholder="El texto que pegarás en Instagram/Facebook">{{ pub.texto }}</textarea>
   <div class="ayuda" id="vars_normal">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00).</div>
@@ -2991,9 +3316,10 @@ function mostrarModo() {
   document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
   document.getElementById('caja_lista').hidden = document.querySelector('select[name=diseno]').value !== 'lista';
   document.getElementById('caja_horario').hidden = !document.getElementById('h_usar').checked;
+  document.getElementById('caja_deportes').hidden = !document.getElementById('d_usar').checked;
   document.getElementById('h_fechas').hidden = !document.querySelector('input[name=h_dias][value=fechas]').checked;
 }
-document.querySelectorAll('input[name=modo], select[name=momento], select[name=diseno], #h_usar, input[name=h_dias]')
+document.querySelectorAll('input[name=modo], select[name=momento], select[name=diseno], #h_usar, input[name=h_dias], #d_usar')
   .forEach(r => r.addEventListener('change', mostrarModo));
 // A qué eventos de ahora se aplica (igual que eventos_de() en el servidor)
 const EVENTOS = {{ eventos_filtro|tojson }};
@@ -3186,6 +3512,7 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   <form class="enlinea" method="post" action="{{ url_for('detectar_telegram') }}"><button>Detectar mi chat</button></form>
   <form class="enlinea" method="post" action="{{ url_for('probar_telegram') }}"><button>Probar Telegram</button></form>
   <form class="enlinea" method="post" action="{{ url_for('leer_eventos') }}"><input type="hidden" name="volver" value="ajustes"><button>Probar Racecore y CKS</button></form>
+  <form class="enlinea" method="post" action="{{ url_for('actualizar_deportes_ahora') }}"><button>Leer deportes de Marca</button></form>
 </div>
 
 <h2>Estado</h2>
@@ -3200,6 +3527,8 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   {% if tandas_categoria %}<div>Fotos de tandas: {% if tandas.error %}<span class="chip error">aviso</span> <span class="ayuda">{{ tandas.error }}</span>
     {% elif tandas.ok %}<span class="chip on">funcionando</span> última lectura {{ tandas.ok }} · {{ tandas.total }} foto(s) de la última semana{% if tandas.no_publicables %} · {{ tandas.no_publicables }} tanda(s) sin permiso{% endif %}
     {% else %}<span class="chip">pendiente</span>{% endif %}</div>{% endif %}
+  <div>Deportes (Marca): {% for d in deportes %}{{ d.nombre }} {% if d.error %}<span class="chip error">fallo</span> <span class="ayuda">{{ d.error }}</span>{% elif d.ok %}<span class="chip on">{{ d.ok }}</span>{% else %}<span class="chip">sin leer</span>{% endif %}{{ ' · ' if not loop.last }}{% endfor %}
+    <div class="ayuda">Se lee solo si hay alguna publicación activa con «Deportes en TV».</div></div>
   <div>Fuentes propias: {% if fuentes %}<span class="chip on">{{ fuentes|join(', ') }}</span>{% else %}<span class="chip">las incluidas</span> <span class="ayuda">opcional: Titulo.ttf y Texto.ttf en la carpeta «fuentes»</span>{% endif %}</div>
   <div class="ayuda" style="margin-top:8px">Carpeta del panel: {{ carpeta }}</div>
 </div>
