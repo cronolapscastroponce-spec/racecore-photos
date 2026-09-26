@@ -34,17 +34,34 @@ foreach ($a in $archivos) {
     New-Item -ItemType Directory -Force -Path (Split-Path $destino) | Out-Null
     Invoke-WebRequest -UseBasicParsing -Uri "$base/$($a)?v=$marca" -OutFile $destino
 }
-# Solo se copia cuando todo se ha descargado bien
+# Solo se copia cuando todo se ha descargado bien, y solo lo que ha cambiado: si el panel
+# esta en marcha tiene abiertas las fuentes y Windows no deja sobrescribirlas.
+$bloqueados = @()
 foreach ($a in $archivos) {
+    $origen = Join-Path $tmp $a
     $destino = Join-Path $carpeta $a
+    $igual = $false
+    try { $igual = (Test-Path $destino) -and ((Get-FileHash $origen).Hash -eq (Get-FileHash $destino).Hash) } catch {}
+    if ($igual) { continue }
     New-Item -ItemType Directory -Force -Path (Split-Path $destino) | Out-Null
-    Copy-Item (Join-Path $tmp $a) $destino -Force
+    try {
+        Copy-Item $origen $destino -Force
+        Write-Host "  actualizado: $a"
+    } catch {
+        $bloqueados += $a
+    }
 }
 
 Write-Host "Actualizando librerias..."
 & (Join-Path $carpeta ".venv\Scripts\python.exe") -m pip install -r (Join-Path $carpeta "requirements.txt") --quiet --disable-pip-version-check
 
 Write-Host ""
+if ($bloqueados) {
+    Write-Host "No se han podido actualizar porque el panel los esta usando:" -ForegroundColor Yellow
+    $bloqueados | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+    Write-Host "Cierra el panel (la ventana negra, o quitar_arranque_automatico.bat) y vuelve a abrir actualizar.bat." -ForegroundColor Yellow
+    Write-Host ""
+}
 Write-Host "==========  ACTUALIZADO  =========="
 if (Get-ScheduledTask -TaskName "Racecore Redes" -ErrorAction SilentlyContinue) {
     Write-Host "Para que se aplique: doble clic en 3_arranque_automatico.bat"
