@@ -68,6 +68,23 @@ HORAS_TANDAS = 168                  # fotos de tandas de CKS: se guardan las de 
 MAX_TANDAS_CKS = 40                 # CKS da como mucho las 40 tandas más recientes
 LADO_MAX_TANDA = 2400               # (llegan a 1280-1920 px; así no se agrandan)
 MOMENTOS = {"antes": "Antes del evento", "dia": "El mismo día", "despues": "Después del evento"}
+# Tipos de publicación: el formulario solo enseña lo de cada uno
+TIPOS = {
+    "normal": ("Normal", "Tus fotos y tus textos, los días que elijas."),
+    "evento": ("Eventos", "Se programa sola antes o después de cada evento de Racecore, CKS o a mano."),
+    "horario": ("Horario de apertura", "Fines de semana, puentes y fiestas, quitando las horas de los eventos."),
+    "deportes": ("Deportes en TV", "F1, MotoGP y fútbol para la cafetería. Si no hay nada, no se publica."),
+}
+
+
+def tipo_de(pub):
+    if pub["modo"] == "evento":
+        return "evento"
+    if pub["horario"]:
+        return "horario"
+    return "deportes" if pub["deportes"] else "normal"
+
+
 # Plantilla de horario de apertura
 ACTIVIDADES = ["Kart Rental", "Entrenos Motos", "Entrenos Karting"]
 # Deportes en TV para la cafetería: calendarios y guía de TV de Marca (horas de España)
@@ -1018,7 +1035,7 @@ def leer_deportes(texto):
 
 
 def lista_deportes(cfg, occ):
-    """[(fecha, hora, línea)] de lo que cae dentro del horario de la cafetería en los días de la publicación."""
+    """[(fecha, hora, línea, deporte)] de lo que cae dentro del horario de la cafetería en los días de la publicación."""
     desde = occ.date()
     dias = [(desde + timedelta(days=i)).isoformat() for i in range(cfg["dias"])]
     apertura, cierre = minutos(cfg["apertura"]), minutos(cfg["cierre"])
@@ -1034,7 +1051,8 @@ def lista_deportes(cfg, occ):
         for e in consulta(f"SELECT * FROM emisiones WHERE fuente = ? AND fecha IN ({marca}) ORDER BY fecha, hora",
                           [fuente, *dias]):
             if cabe(e["hora"], DURACION.get((fuente, e["sesion"]), 60)):
-                res.append((e["fecha"], e["hora"], f"{e['hora']} · {MARCA[fuente][0]} {e['titulo']} · {e['sesion']}"))
+                res.append((e["fecha"], e["hora"], f"{e['hora']} · {MARCA[fuente][0]} {e['titulo']} · {e['sesion']}",
+                            fuente))
     if cfg.get("futbol"):
         equipos = {x.strip().casefold() for x in (cfg.get("equipos") or "").split(",") if x.strip()}
         canal = (cfg.get("canal") or "").strip().casefold()
@@ -1045,13 +1063,13 @@ def lista_deportes(cfg, occ):
             if (e["deporte"].casefold() == "fútbol" and lados & equipos and canal in e["canal"].casefold()
                     and not any(x in e["competicion"].casefold() for x in fuera)
                     and cabe(e["hora"], DURACION[("futbol", "")])):
-                res.append((e["fecha"], e["hora"], f"{e['hora']} · {e['titulo']} · {e['canal']}"))
+                res.append((e["fecha"], e["hora"], f"{e['hora']} · {e['titulo']} · {e['canal']}", "futbol"))
     return sorted(res)
 
 
 def texto_deportes(filas):
     lineas, dia = [], None
-    for fecha, _, linea in filas:
+    for fecha, _, linea, _ in filas:
         if fecha != dia:
             dia = fecha
             d = date.fromisoformat(fecha)
@@ -1076,6 +1094,12 @@ def con_deportes(pub, occ):
     for campo in ("titulo", "subtitulo", "pie", "texto", "prompt_ia", "lista"):
         for clave, valor in valores.items():
             datos[campo] = (datos[campo] or "").replace(clave, valor)
+    # Fotos: las del deporte que sale (elegidas en «Deportes en TV»); si no hay, un fondo genérico del deporte
+    presentes = list(dict.fromkeys(f[3] for f in filas)) or [d for d in ("f1", "motogp", "futbol") if cfg.get(d)]
+    cats = list(dict.fromkeys(como_entero(cfg.get(f"foto_{d}")) for d in presentes if como_entero(cfg.get(f"foto_{d}"))))
+    datos["categoria_id"] = cats[0] if cats else None
+    datos["categorias_extra"] = ",".join(str(c) for c in cats[1:])
+    datos["_fondo_deporte"] = presentes[0] if presentes else ""
     datos["_vacia"] = not filas
     if not filas:
         datos["_aviso"] = ((datos.get("_aviso") or "") + " No hay nada de deportes que cumpla las condiciones "
@@ -1156,6 +1180,67 @@ def fondo_liso(ancho, alto, color):
     mascara = Image.linear_gradient("L").resize((ancho, alto))
     return Image.composite(Image.new("RGB", (ancho, alto), (10, 10, 12)),
                            Image.new("RGB", (ancho, alto), arriba), mascara)
+
+
+def fondo_deporte(deporte, ancho, alto):
+    """Fondo genérico dibujado por el panel (sin fotos ni marcas de nadie): campo de fútbol, o asfalto
+    con pianos y bandera a cuadros para la F1 y MotoGP."""
+    W, H = ancho, alto
+    rnd = random.Random(deporte)
+    if deporte == "futbol":
+        img = Image.new("RGB", (W, H))
+        d = ImageDraw.Draw(img)
+        franjas = 12
+        for i in range(franjas):  # césped cortado a franjas
+            d.rectangle([0, H * i // franjas, W, H * (i + 1) // franjas],
+                        fill=(38, 128, 58) if i % 2 else (31, 112, 50))
+        g, m = max(4, W // 150), int(W * 0.06)
+        blanco = (235, 240, 235)
+        d.rectangle([m, m, W - m, H - m], outline=blanco, width=g)
+        d.line([(m, H // 2), (W - m, H // 2)], fill=blanco, width=g)
+        r = int(W * 0.16)
+        d.ellipse([W // 2 - r, H // 2 - r, W // 2 + r, H // 2 + r], outline=blanco, width=g)
+        d.ellipse([W // 2 - g * 2, H // 2 - g * 2, W // 2 + g * 2, H // 2 + g * 2], fill=blanco)
+        for arriba in (True, False):  # áreas
+            for ancho_a, fondo_a in ((0.62, 0.15), (0.3, 0.06)):
+                x0, x1 = int(W * (1 - ancho_a) / 2), int(W * (1 + ancho_a) / 2)
+                y0, y1 = (m, m + int(H * fondo_a)) if arriba else (H - m - int(H * fondo_a), H - m)
+                d.rectangle([x0, y0, x1, y1], outline=blanco, width=g)
+        img = img.filter(ImageFilter.GaussianBlur(W / 700))
+    else:
+        # asfalto con grano
+        ruido = Image.effect_noise((W, H), 40).point(lambda v: 28 + v // 7)
+        img = Image.merge("RGB", (ruido, ruido, ruido.point(lambda v: v + 4)))
+        d = ImageDraw.Draw(img)
+        # piano rojo y blanco (azul y blanco en MotoGP) cruzando en diagonal
+        color = (215, 25, 30) if deporte == "f1" else (20, 90, 200)
+        capa = Image.new("RGBA", (W * 2, int(W * 0.09)), (0, 0, 0, 0))
+        dc = ImageDraw.Draw(capa)
+        paso = int(W * 0.08)
+        for i in range(0, capa.width, paso):
+            dc.rectangle([i, 0, i + paso, capa.height], fill=(color if (i // paso) % 2 else (240, 240, 240)) + (255,))
+        capa = capa.rotate(-28, expand=True, resample=Image.BICUBIC)
+        img.paste(capa, (-W // 2, int(H * 0.62) - capa.height // 2), capa)
+        # bandera a cuadros que se desvanece, arriba a la derecha
+        lado = int(W * 0.06)
+        bandera = Image.new("L", (W, H), 0)
+        db = ImageDraw.Draw(bandera)
+        for fila in range(int(H * 0.45 / lado) + 1):
+            for col in range(W // lado + 1):
+                if (fila + col) % 2 == 0:
+                    db.rectangle([col * lado, fila * lado, (col + 1) * lado, (fila + 1) * lado], fill=255)
+        desvanece = Image.linear_gradient("L").resize((W, H)).point(lambda v: max(0, 150 - v))
+        img.paste((235, 235, 235), (0, 0), ImageChops.multiply(bandera, desvanece))
+        # estelas de velocidad
+        estelas = Image.new("L", (W, H), 0)
+        de = ImageDraw.Draw(estelas)
+        for _ in range(14):
+            y = rnd.uniform(H * 0.25, H * 0.95)
+            largo = rnd.uniform(W * 0.3, W * 0.8)
+            x = rnd.uniform(-W * 0.2, W * 0.6)
+            de.line([(x, y), (x + largo, y - largo * 0.53)], fill=rnd.randint(60, 140), width=rnd.randint(2, 5))
+        img.paste(color, (0, 0), estelas.filter(ImageFilter.GaussianBlur(3)))
+    return ImageEnhance.Brightness(img).enhance(0.8)
 
 
 def superponer_sencillo(img, pub, occ):
@@ -1726,7 +1811,10 @@ def componer(pub, occ, evitar=None, evitar_estilo=None):
     foto = elegir_foto(pub["id"], fotos, evitar)
     fondo, con_ia = None, False
 
-    if foto is None:
+    deporte = pub["_fondo_deporte"] if "_fondo_deporte" in pub.keys() else ""
+    if foto is None and deporte:
+        fondo = fondo_deporte(deporte, ancho, alto)
+    elif foto is None:
         avisos.append("Las categorías elegidas no tienen fotos: se ha usado un fondo liso." if ids
                       else "No has elegido categoría de fotos: se ha usado un fondo liso.")
         fondo = fondo_liso(ancho, alto, pub["color"])
@@ -2051,7 +2139,8 @@ NUEVA = {"id": None, "nombre": "", "activa": 1, "modo": "semanal", "dias": "", "
          "momento": "antes", "dias_desde": 14, "dias_hasta": 3, "cada": 2, "filtro": "", "condicion": "",
          "lista": "", "categorias_extra": "", "horario": "", "deportes": ""}
 DEPORTES_NUEVA = {"f1": False, "motogp": False, "futbol": False, "equipos": "Real Madrid, Barcelona",
-                  "canal": "DAZN", "excluir": "Liga F", "dias": 4, "apertura": "10:00", "cierre": "20:00"}
+                  "canal": "DAZN", "excluir": "Liga F", "dias": 4, "apertura": "10:00", "cierre": "20:00",
+                  "foto_f1": "", "foto_motogp": "", "foto_futbol": ""}
 PLANTILLAS_DEPORTES = {
     "motor": {"nombre": "F1 y MotoGP en la cafetería", "activa": 0, "modo": "semanal", "dias": "3", "hora": "12:00",
               "formato": "vertical", "diseno": "lista", "lista": "{deportes}",
@@ -2092,7 +2181,8 @@ def publicaciones():
             "proxima": (cuando_txt(occ) + (f" · {ev['nombre']}" if ev else "")) if occ else "",
             "genera": genera.strftime("%d/%m %H:%M") if genera else "",
         })
-    return render_template("publicaciones.html", filas=filas)
+    grupos = [(TIPOS[t][0], [f for f in filas if tipo_de(f) == t]) for t in TIPOS]
+    return render_template("publicaciones.html", filas=filas, grupos=[g for g in grupos if g[1]])
 
 
 def guardar_filtro(f):
@@ -2104,9 +2194,7 @@ def guardar_filtro(f):
 
 
 def guardar_horario(f):
-    """Horario de apertura del formulario, en JSON (vacío si no se usa)."""
-    if not f.get("h_usar"):
-        return ""
+    """Horario de apertura del formulario, en JSON."""
     actividades = []
     for i in range(len(ACTIVIDADES) + 1):
         nombre = f.get(f"h_nombre_{i}", "").strip()
@@ -2123,11 +2211,12 @@ def guardar_horario(f):
 
 def guardar_deportes(f):
     """Deportes en TV del formulario, en JSON (vacío si no se usa)."""
-    if not f.get("d_usar") or not (f.get("d_f1") or f.get("d_motogp") or f.get("d_futbol")):
+    if not (f.get("d_f1") or f.get("d_motogp") or f.get("d_futbol")):
         return ""
     return json.dumps({"f1": bool(f.get("d_f1")), "motogp": bool(f.get("d_motogp")), "futbol": bool(f.get("d_futbol")),
                        "equipos": f.get("d_equipos", "").strip(), "canal": f.get("d_canal", "").strip(),
                        "excluir": f.get("d_excluir", "").strip(),
+                       **{f"foto_{d}": como_entero(f.get(f"d_foto_{d}")) or "" for d in ("f1", "motogp", "futbol")},
                        "dias": min(14, max(1, como_entero(f.get("d_dias")) or 1)),
                        "apertura": leer_hora(f.get("d_apertura")) or "10:00",
                        "cierre": leer_hora(f.get("d_cierre")) or "20:00"}, ensure_ascii=False)
@@ -2136,6 +2225,9 @@ def guardar_deportes(f):
 def leer_formulario():
     f = request.form
     errores = []
+    tipo = f.get("tipo") if f.get("tipo") in TIPOS else (  # sin el campo «tipo», como antes
+        "evento" if f.get("modo") == "evento" else "horario" if f.get("h_usar") else "deportes" if f.get("d_usar")
+        else "normal")
     dias = sorted({x for x in f.getlist("dias") if x in "0123456"})
     hora = f.get("hora", "").strip()
     try:
@@ -2163,7 +2255,7 @@ def leer_formulario():
     datos = {
         "nombre": f.get("nombre", "").strip() or "Sin nombre",
         "activa": 1 if f.get("activa") else 0,
-        "modo": f.get("modo") if f.get("modo") in ("fecha", "evento") else "semanal",
+        "modo": "evento" if tipo == "evento" else ("fecha" if f.get("modo") == "fecha" else "semanal"),
         "dias": ",".join(dias),
         "fecha": f.get("fecha", "").strip(),
         "hora": hora,
@@ -2187,11 +2279,15 @@ def leer_formulario():
         "condicion": f.get("condicion") if f.get("condicion") in CONDICIONES else "",
         "categorias_extra": ",".join(sorted({x for x in f.getlist("categorias_extra") if x.isdigit()
                                              and x != str(categoria_id)}, key=int)),
-        "horario": guardar_horario(f),
-        "deportes": guardar_deportes(f),
+        "horario": guardar_horario(f) if tipo == "horario" else "",
+        "deportes": guardar_deportes(f) if tipo == "deportes" else "",
     }
     if datos["modo"] == "semanal" and not dias:
         errores.append("Marca al menos un día de la semana.")
+    if tipo == "deportes" and not datos["deportes"]:
+        errores.append("Marca al menos F1, MotoGP o Fútbol.")
+    if tipo == "horario" and f.get("h_dias") == "fechas" and not leer_fecha(f.get("h_desde")):
+        errores.append("Pon las fechas del horario.")
     if datos["modo"] == "fecha":
         try:
             date.fromisoformat(datos["fecha"])
@@ -2256,9 +2352,10 @@ def editar_publicacion(pub_id=None):
             f"Nada que cumpla las condiciones para el {cuando_txt(occ)}: ese día no se publica."
     return render_template("publicacion.html", pub=pub, formatos=FORMATOS, dias=DIAS,
                            filtro=filtro, campeonatos=campeonatos, sueltos=sueltos,
-                           deportes=deportes or DEPORTES_NUEVA, usa_deportes=bool(deportes), vista_deportes=vista_dep,
+                           deportes=deportes or DEPORTES_NUEVA, vista_deportes=vista_dep,
+                           tipos=TIPOS, tipo=request.form.get("tipo") if request.form.get("tipo") in TIPOS else tipo_de(pub),
                            horario=horario or {"dias": "finde", "apertura": "10:00", "cierre": "20:00"},
-                           usa_horario=bool(horario), filas_h=filas_h[:len(ACTIVIDADES) + 1], vista_horario=vista,
+                           filas_h=filas_h[:len(ACTIVIDADES) + 1], vista_horario=vista,
                            extras={x for x in (pub["categorias_extra"] or "").split(",") if x},
                            eventos_filtro=[{"n": e["nombre"], "c": e["campeonato"]} for e in todos],
                            categorias=consulta("SELECT * FROM categorias ORDER BY nombre"),
@@ -3087,7 +3184,9 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
 <a class="boton" href="{{ url_for('editar_publicacion', plantilla='motor') }}">+ F1 y MotoGP</a>
 <a class="boton" href="{{ url_for('editar_publicacion', plantilla='futbol') }}">+ Fútbol</a>
 <a class="boton principal" href="{{ url_for('editar_publicacion') }}">+ Nueva publicación</a></div></div>
-{% for p in filas %}
+{% for titulo, lista in grupos %}
+<h2>{{ titulo }}</h2>
+{% for p in lista %}
 <div class="caja">
   <div class="fila" style="justify-content:space-between">
     <div>
@@ -3110,6 +3209,7 @@ PLANTILLAS["publicaciones.html"] = """{% extends "base.html" %}
     </div>
   </div>
 </div>
+{% endfor %}
 {% else %}
 <div class="vacio">Aún no hay publicaciones. Crea la primera con «+ Nueva publicación».</div>
 {% endfor %}
@@ -3121,11 +3221,16 @@ PLANTILLAS["publicacion.html"] = """{% extends "base.html" %}
 <style>
 .dos { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
 .tres { display:grid; grid-template-columns:1fr 1fr 1fr; gap:0 16px; }
+.tipos { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+.tipos label { display:flex; gap:10px; align-items:flex-start; margin:0; padding:10px 12px; border:1px solid var(--borde);
+  border-radius:10px; color:var(--texto); font-size:15px; cursor:pointer; }
+.tipos label:has(input:checked) { border-color:var(--acento); background:#26181c; }
+.tipos .ayuda { display:block; margin-top:2px; }
 table.actividades { border-collapse:collapse; width:100%; min-width:520px; }
 table.actividades th { color:var(--suave); font-size:13px; font-weight:normal; text-align:left; padding:4px; }
 table.actividades td { padding:4px; }
 pre.vista { background:#0d0e10; border:1px solid var(--borde); border-radius:8px; padding:10px; white-space:pre-wrap; font:inherit; }
-@media (max-width:640px) { .dos { grid-template-columns:1fr; } }
+@media (max-width:640px) { .dos, .tres, .tipos { grid-template-columns:1fr; } }
 .dias label { display:inline-flex; gap:4px; align-items:center; margin:6px 10px 0 0; color:var(--texto); font-size:15px; }
 .opciones label { display:inline-flex; gap:6px; align-items:center; margin:6px 16px 0 0; color:var(--texto); font-size:15px; }
 input[type=color] { width:60px; height:40px; border:none; background:none; padding:0; }
@@ -3138,18 +3243,26 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 </div>
 
 <div class="caja">
-  <b>¿Cuándo?</b>
-  <div class="opciones">
-    <label><input type="radio" name="modo" value="semanal" {{ 'checked' if pub.modo != 'fecha' }}> Días de la semana</label>
-    <label><input type="radio" name="modo" value="fecha" {{ 'checked' if pub.modo == 'fecha' }}> Fecha concreta</label>
-    <label><input type="radio" name="modo" value="evento" {{ 'checked' if pub.modo == 'evento' }}> Eventos</label>
+  <b>¿Qué tipo de publicación es?</b>
+  <div class="tipos">
+    {% for clave, t in tipos.items() %}<label><input type="radio" name="tipo" value="{{ clave }}" {{ 'checked' if clave == tipo }}>
+      <span><b>{{ t[0] }}</b><span class="ayuda">{{ t[1] }}</span></span></label>{% endfor %}
   </div>
-  <div id="semanal" class="dias">
-    {% for d in dias %}<label><input type="checkbox" name="dias" value="{{ loop.index0 }}" {{ 'checked' if loop.index0|string in dias_marcados }}> {{ d }}</label>{% endfor %}
+</div>
+
+<div class="caja">
+  <b>¿Cuándo se publica?</b>
+  <div id="cuando_fijo">
+    <div class="opciones">
+      <label><input type="radio" name="modo" value="semanal" {{ 'checked' if pub.modo != 'fecha' }}> Días de la semana</label>
+      <label><input type="radio" name="modo" value="fecha" {{ 'checked' if pub.modo == 'fecha' }}> Fecha concreta</label>
+    </div>
+    <div id="semanal" class="dias">
+      {% for d in dias %}<label><input type="checkbox" name="dias" value="{{ loop.index0 }}" {{ 'checked' if loop.index0|string in dias_marcados }}> {{ d }}</label>{% endfor %}
+    </div>
+    <div id="fecha"><label>Fecha</label><input type="date" name="fecha" value="{{ pub.fecha }}"></div>
   </div>
-  <div id="fecha"><label>Fecha</label><input type="date" name="fecha" value="{{ pub.fecha }}"></div>
   <div id="evento">
-    <div class="ayuda">Se publica sola para cada evento de la pestaña Eventos (los de Racecore, los de CKS y los creados a mano).</div>
     <div class="dos">
       <div><label>¿Cuándo, respecto al evento?</label>
         <select name="momento">{% for clave, t in momentos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.momento }}>{{ t }}</option>{% endfor %}</select></div>
@@ -3180,21 +3293,84 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
   <div class="ayuda">1440 = un día antes. La imagen se prepara en cuanto el PC esté encendido dentro de ese margen.</div>
 </div>
 
+<div class="caja" id="caja_horario">
+  <b>Horario de apertura</b>
+  <div class="opciones">
+    <label><input type="radio" name="h_dias" value="finde" {{ 'checked' if horario.dias != 'fechas' }}> El fin de semana siguiente a la publicación (sábado y domingo)</label>
+    <label><input type="radio" name="h_dias" value="fechas" {{ 'checked' if horario.dias == 'fechas' }}> Estas fechas (puentes, fiestas…)</label>
+  </div>
+  <div class="dos" id="h_fechas">
+    <div><label>Desde</label><input type="date" name="h_desde" value="{{ horario.desde or '' }}"></div>
+    <div><label>Hasta</label><input type="date" name="h_hasta" value="{{ horario.hasta or '' }}"></div>
+  </div>
+  <div class="dos">
+    <div><label>Apertura</label><input type="time" name="h_apertura" value="{{ horario.apertura }}"></div>
+    <div><label>Cierre</label><input type="time" name="h_cierre" value="{{ horario.cierre }}"></div>
+  </div>
+  <label>Qué hay abierto (deja las horas vacías para usar las de apertura y cierre)</label>
+  <div style="overflow-x:auto"><table class="actividades">
+    <tr><th></th><th>Actividad</th><th>Desde</th><th>Hasta</th><th title="Si hay un evento, se quitan sus horas">Se corta con eventos</th></tr>
+    {% for a in filas_h %}<tr>
+      <td><input type="checkbox" name="h_activa_{{ loop.index0 }}" value="1" {{ 'checked' if a.activa }}></td>
+      <td><input type="text" name="h_nombre_{{ loop.index0 }}" value="{{ a.nombre }}" placeholder="Otra actividad"></td>
+      <td><input type="time" name="h_desde_{{ loop.index0 }}" value="{{ a.desde or '' }}"></td>
+      <td><input type="time" name="h_hasta_{{ loop.index0 }}" value="{{ a.hasta or '' }}"></td>
+      <td style="text-align:center"><input type="checkbox" name="h_evento_{{ loop.index0 }}" value="1" {{ 'checked' if a.evento }}></td>
+    </tr>{% endfor %}
+  </table></div>
+  <div class="ayuda">Si esos días hay un evento (Racecore, CKS o a mano), se quitan las horas que ocupa. Lo que ocupa cada evento se elige en la pestaña <a href="{{ url_for('eventos') }}">Eventos</a> (normalmente, la mañana).</div>
+  <div class="ayuda">El horario sale solo en el centro del cartel. Para el texto: {horario}, {dias_horario} («sábado 11 y domingo 12 de octubre») y {eventos_horario}.</div>
+  {% if vista_horario %}<label>Así saldría la próxima vez</label><pre class="vista">{{ vista_horario }}</pre>{% endif %}
+</div>
+
+<div class="caja" id="caja_deportes">
+  <b>Deportes en TV para la cafetería</b> <span class="ayuda">(horarios de Marca)</span>
+  <div class="opciones">
+    <label><input type="checkbox" name="d_f1" value="1" {{ 'checked' if deportes.f1 }}> F1</label>
+    <label><input type="checkbox" name="d_motogp" value="1" {{ 'checked' if deportes.motogp }}> MotoGP</label>
+    <label><input type="checkbox" name="d_futbol" value="1" id="d_futbol" {{ 'checked' if deportes.futbol }}> Fútbol</label>
+  </div>
+  <div class="ayuda">De la F1 y MotoGP salen la clasificación, el sprint y la carrera (sin libres).</div>
+  <div class="tres" id="d_futbol_campos">
+    <div><label>Equipos</label><input type="text" name="d_equipos" value="{{ deportes.equipos }}"></div>
+    <div><label>Solo si lo da el canal</label><input type="text" name="d_canal" value="{{ deportes.canal }}" placeholder="Vacío = cualquiera"></div>
+    <div><label>Sin estas competiciones</label><input type="text" name="d_excluir" value="{{ deportes.excluir }}" placeholder="Ej: Liga F"></div>
+  </div>
+  <div class="tres">
+    <div><label>Días (desde el de la publicación)</label><input type="number" name="d_dias" min="1" max="14" value="{{ deportes.dias }}"></div>
+    <div><label>Abre la cafetería</label><input type="time" name="d_apertura" value="{{ deportes.apertura }}"></div>
+    <div><label>Cierra</label><input type="time" name="d_cierre" value="{{ deportes.cierre }}"></div>
+  </div>
+  <div class="ayuda">Solo sale lo que empieza después de abrir y acaba antes de cerrar (un partido son unas 2 horas). Si no hay nada, ese día no se publica. La guía de TV de Marca solo trae hoy y mañana: el fútbol se publica el mismo día.</div>
+  <label>Fotos de cada deporte</label>
+  <div class="tres">
+    {% for clave, nombre in [('f1', 'F1'), ('motogp', 'MotoGP'), ('futbol', 'Fútbol')] %}
+    <div><span class="ayuda">{{ nombre }}</span>
+      <select name="d_foto_{{ clave }}"><option value="">Fondo genérico del panel</option>
+      {% for c in categorias %}<option value="{{ c.id }}" {{ 'selected' if c.id|string == deportes['foto_' ~ clave]|string }}>{{ c.nombre }}</option>{% endfor %}
+      </select></div>{% endfor %}
+  </div>
+  <div class="ayuda">Se usa la del deporte que salga ese día. «Fondo genérico» lo dibuja el panel: un campo de fútbol, o asfalto con pianos y bandera a cuadros. No uses fotos oficiales de internet: tienen derechos.</div>
+  <div class="ayuda">Los horarios salen solos en el centro del cartel. Para el texto: {deportes} y {dias_deportes}.</div>
+  {% if vista_deportes %}<label>Así saldría la próxima vez</label><pre class="vista">{{ vista_deportes }}</pre>{% endif %}
+</div>
+
 <div class="caja">
   <b>Imagen</b>
+  <div id="fotos_pub">
   <div class="dos">
     <div><label>Categoría de fotos</label>
       <select name="categoria_id"><option value="">— elige —</option>
       {% for c in categorias %}<option value="{{ c.id }}" {{ 'selected' if c.id == pub.categoria_id }}>{{ c.nombre }}</option>{% endfor %}
       </select></div>
-    <div><label>Formato</label>
-      <select name="formato">{% for clave, f in formatos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.formato }}>{{ f[0] }}</option>{% endfor %}</select></div>
   </div>
   {% if categorias|length > 1 %}
   <label>Y también fotos de (opcional)</label>
   <div class="opciones">{% for c in categorias %}<label><input type="checkbox" name="categorias_extra" value="{{ c.id }}" {{ 'checked' if c.id|string in extras }}> {{ c.nombre }}</label>{% endfor %}</div>
   <div class="ayuda">Cada vez coge una foto al azar de todas las categorías marcadas.</div>
   {% endif %}
+  </div>
+  <div id="fotos_deportes" class="ayuda" style="margin-top:8px">Las fotos se eligen arriba, en «Deportes en TV».</div>
   <div class="dos">
     <div><label>Diseño</label>
       <select name="diseno">
@@ -3205,10 +3381,12 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
       </select></div>
     <div><label>Color de acento</label><input type="color" name="color" value="{{ pub.color }}"></div>
   </div>
+  <label>Formato</label>
+  <select name="formato">{% for clave, f in formatos.items() %}<option value="{{ clave }}" {{ 'selected' if clave == pub.formato }}>{{ f[0] }}</option>{% endfor %}</select>
   <div id="caja_lista">
     <label>Lista en el centro de la imagen</label>
     <textarea name="lista" placeholder="{pilotos}">{{ pub.lista }}</textarea>
-    <div class="ayuda">Una línea por nombre. Con {pilotos} (o vacío, en publicaciones de eventos) salen los inscritos del evento. Las líneas que acaban en «:» salen en amarillo (categorías). Si son muchos, salen en 2, 3 o 4 columnas.</div>
+    <div class="ayuda">Una línea por nombre. En eventos, con {pilotos} (o vacío) salen los inscritos. Las líneas que acaban en «:» salen en amarillo (categorías). Si son muchos, salen en 2, 3 o 4 columnas.</div>
   </div>
   <label>Título</label>
   <textarea name="titulo" rows="2" style="min-height:0" placeholder="Ej:&#10;{dia}&#10;DE *RECORD !!*">{{ pub.titulo }}</textarea>
@@ -3235,70 +3413,13 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 </div>
 
 <div class="caja">
-  <label style="color:var(--texto); margin:0"><input type="checkbox" name="h_usar" value="1" id="h_usar" {{ 'checked' if usa_horario }}> <b>Horario de apertura</b> <span class="ayuda">(fines de semana, puentes, fiestas…)</span></label>
-  <div id="caja_horario">
-    <div class="opciones">
-      <label><input type="radio" name="h_dias" value="finde" {{ 'checked' if horario.dias != 'fechas' }}> El fin de semana siguiente a la publicación (sábado y domingo)</label>
-      <label><input type="radio" name="h_dias" value="fechas" {{ 'checked' if horario.dias == 'fechas' }}> Estas fechas</label>
-    </div>
-    <div class="dos" id="h_fechas">
-      <div><label>Desde</label><input type="date" name="h_desde" value="{{ horario.desde or '' }}"></div>
-      <div><label>Hasta</label><input type="date" name="h_hasta" value="{{ horario.hasta or '' }}"></div>
-    </div>
-    <div class="dos">
-      <div><label>Apertura</label><input type="time" name="h_apertura" value="{{ horario.apertura }}"></div>
-      <div><label>Cierre</label><input type="time" name="h_cierre" value="{{ horario.cierre }}"></div>
-    </div>
-    <label>Qué hay abierto (deja las horas vacías para usar las de apertura y cierre)</label>
-    <div style="overflow-x:auto"><table class="actividades">
-      <tr><th></th><th>Actividad</th><th>Desde</th><th>Hasta</th><th title="Si hay un evento, se quitan sus horas">Se corta con eventos</th></tr>
-      {% for a in filas_h %}<tr>
-        <td><input type="checkbox" name="h_activa_{{ loop.index0 }}" value="1" {{ 'checked' if a.activa }}></td>
-        <td><input type="text" name="h_nombre_{{ loop.index0 }}" value="{{ a.nombre }}" placeholder="Otra actividad"></td>
-        <td><input type="time" name="h_desde_{{ loop.index0 }}" value="{{ a.desde or '' }}"></td>
-        <td><input type="time" name="h_hasta_{{ loop.index0 }}" value="{{ a.hasta or '' }}"></td>
-        <td style="text-align:center"><input type="checkbox" name="h_evento_{{ loop.index0 }}" value="1" {{ 'checked' if a.evento }}></td>
-      </tr>{% endfor %}
-    </table></div>
-    <div class="ayuda">Si esos días hay un evento (Racecore, CKS o a mano), se quitan las horas que ocupa. Lo que ocupa cada evento se elige en la pestaña <a href="{{ url_for('eventos') }}">Eventos</a> (normalmente, la mañana).</div>
-    <div class="ayuda">Variables: {horario} (el horario día a día; con el diseño «Cartel con lista» sale en el centro), {dias_horario} («sábado 11 y domingo 12 de octubre») y {eventos_horario}.</div>
-    {% if vista_horario %}<label>Así saldría la próxima vez</label><pre class="vista">{{ vista_horario }}</pre>{% endif %}
-  </div>
-</div>
-
-<div class="caja">
-  <label style="color:var(--texto); margin:0"><input type="checkbox" name="d_usar" value="1" id="d_usar" {{ 'checked' if usa_deportes }}> <b>Deportes en TV para la cafetería</b> <span class="ayuda">(horarios de Marca)</span></label>
-  <div id="caja_deportes">
-    <div class="opciones">
-      <label><input type="checkbox" name="d_f1" value="1" {{ 'checked' if deportes.f1 }}> F1</label>
-      <label><input type="checkbox" name="d_motogp" value="1" {{ 'checked' if deportes.motogp }}> MotoGP</label>
-      <label><input type="checkbox" name="d_futbol" value="1" {{ 'checked' if deportes.futbol }}> Fútbol</label>
-    </div>
-    <div class="ayuda">De la F1 y MotoGP salen la clasificación, el sprint y la carrera (sin libres).</div>
-    <div class="tres">
-      <div><label>Equipos (fútbol)</label><input type="text" name="d_equipos" value="{{ deportes.equipos }}"></div>
-      <div><label>Solo si lo da el canal</label><input type="text" name="d_canal" value="{{ deportes.canal }}" placeholder="Vacío = cualquiera"></div>
-      <div><label>Sin estas competiciones</label><input type="text" name="d_excluir" value="{{ deportes.excluir }}" placeholder="Ej: Liga F"></div>
-    </div>
-    <div class="tres">
-      <div><label>Días (desde el de la publicación)</label><input type="number" name="d_dias" min="1" max="14" value="{{ deportes.dias }}"></div>
-      <div><label>Abre la cafetería</label><input type="time" name="d_apertura" value="{{ deportes.apertura }}"></div>
-      <div><label>Cierra</label><input type="time" name="d_cierre" value="{{ deportes.cierre }}"></div>
-    </div>
-    <div class="ayuda">Solo sale lo que empieza después de abrir y acaba antes de cerrar (un partido dura unas 2 horas). Si no hay nada, ese día no se publica. La guía de TV de Marca solo trae hoy y mañana: para el fútbol, publica el mismo día (con antelación de un día como mucho).</div>
-    <div class="ayuda">Variables: {deportes} (con «Cartel con lista» sale en el centro) y {dias_deportes}.</div>
-    {% if vista_deportes %}<label>Así saldría la próxima vez</label><pre class="vista">{{ vista_deportes }}</pre>{% endif %}
-  </div>
-</div>
-
-<div class="caja">
   <b>Texto del post</b>
   <textarea name="texto" style="min-height:140px" placeholder="El texto que pegarás en Instagram/Facebook">{{ pub.texto }}</textarea>
-  <div class="ayuda" id="vars_normal">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00).</div>
-  <div class="ayuda"><b>Varias versiones:</b> escríbelas en la misma casilla separadas por una línea con <b>---</b> (tres guiones) y el panel las va turnando: la 1ª, luego la 2ª, la 3ª… Vale en Título, Franja y Texto del post, y van juntas: la 2ª versión del título sale con la 2ª del texto. «Generar ahora» pasa cada vez a la siguiente, para que las veas todas.</div>
+  <div class="ayuda" id="vars_normal">En título, subtítulo, pie y texto puedes usar {dia} (sábado), {fecha} (27 de septiembre) y {hora} (18:00) del día de la publicación.</div>
   <div class="ayuda" id="vars_evento">En título, subtítulo, pie y texto puedes usar los datos del evento:
     {evento}, {campeonato}, {dia} {fecha} y {hora} (del evento), {dias} (los que faltan), {faltan} («en 5 días», «mañana», «hoy»),
     {inscritos}, {plazas}, {libres}, {precio}, {enlace} (inscripción), {web}, {horarios}, {resultados}, {ganadores} (para el pie del Cartel) y {pilotos} (nombres de los inscritos, uno por línea).</div>
+  <div class="ayuda"><b>Varias versiones:</b> escríbelas en la misma casilla separadas por una línea con <b>---</b> (tres guiones) y el panel las va turnando: la 1ª, luego la 2ª, la 3ª… Vale en Título, Franja y Texto del post, y van juntas: la 2ª versión del título sale con la 2ª del texto. «Generar ahora» pasa cada vez a la siguiente, para que las veas todas.</div>
 </div>
 
 <div class="fila">
@@ -3308,29 +3429,36 @@ input[type=color] { width:60px; height:40px; border:none; background:none; paddi
 </div>
 </form>
 <script>
-// (no se puede llamar «modo»: dentro del formulario ese nombre es el de los botones de radio)
-function mostrarModo() {
-  const m = document.querySelector('input[name=modo]:checked').value;
-  document.getElementById('fecha').hidden = m !== 'fecha';
-  document.getElementById('semanal').hidden = m !== 'semanal';
-  document.getElementById('evento').hidden = m !== 'evento';
-  document.getElementById('vars_normal').hidden = m === 'evento';
-  document.getElementById('vars_evento').hidden = m !== 'evento';
-  document.getElementById('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
-  document.getElementById('caja_lista').hidden = document.querySelector('select[name=diseno]').value !== 'lista';
-  document.getElementById('caja_horario').hidden = !document.getElementById('h_usar').checked;
-  document.getElementById('caja_deportes').hidden = !document.getElementById('d_usar').checked;
-  document.getElementById('h_fechas').hidden = !document.querySelector('input[name=h_dias][value=fechas]').checked;
+const $ = id => document.getElementById(id);
+// Cada tipo de publicación enseña solo lo suyo
+function mostrar() {
+  const tipo = document.querySelector('input[name=tipo]:checked').value;
+  const modo = document.querySelector('input[name=modo]:checked').value;
+  const conLista = tipo === 'horario' || tipo === 'deportes';  // su lista sale sola
+  $('cuando_fijo').hidden = tipo === 'evento';
+  $('evento').hidden = tipo !== 'evento';
+  $('fecha').hidden = modo !== 'fecha';
+  $('semanal').hidden = modo !== 'semanal';
+  $('rango').hidden = document.querySelector('select[name=momento]').value === 'dia';
+  $('caja_horario').hidden = tipo !== 'horario';
+  $('h_fechas').hidden = !document.querySelector('input[name=h_dias][value=fechas]').checked;
+  $('caja_deportes').hidden = tipo !== 'deportes';
+  $('d_futbol_campos').hidden = !$('d_futbol').checked;
+  $('caja_lista').hidden = conLista || document.querySelector('select[name=diseno]').value !== 'lista';
+  $('fotos_pub').hidden = tipo === 'deportes';
+  $('fotos_deportes').hidden = tipo !== 'deportes';
+  $('vars_normal').hidden = tipo === 'evento';
+  $('vars_evento').hidden = tipo !== 'evento';
 }
-document.querySelectorAll('input[name=modo], select[name=momento], select[name=diseno], #h_usar, input[name=h_dias], #d_usar')
-  .forEach(r => r.addEventListener('change', mostrarModo));
+document.querySelectorAll('input[name=tipo], input[name=modo], select[name=momento], select[name=diseno], input[name=h_dias], #d_futbol')
+  .forEach(r => r.addEventListener('change', mostrar));
 // A qué eventos de ahora se aplica (igual que eventos_de() en el servidor)
 const EVENTOS = {{ eventos_filtro|tojson }};
 function aplica() {
   const marcados = n => [...document.querySelectorAll(`input[name=${n}]:checked`)].map(x => x.value.toLowerCase());
   const camp = marcados('f_campeonato'), evs = marcados('f_evento');
   const t = document.querySelector('input[name=f_texto]').value.trim().toLowerCase();
-  const caja = document.getElementById('aplica');
+  const caja = $('aplica');
   if (!camp.length && !evs.length && !t) { caja.textContent = 'Se aplica a todos los eventos.'; return; }
   const si = EVENTOS.filter(e => camp.includes(e.c.toLowerCase()) || evs.includes(e.n.toLowerCase())
                               || (t && (e.n + ' ' + e.c).toLowerCase().includes(t))).map(e => e.n);
@@ -3339,7 +3467,7 @@ function aplica() {
 document.querySelectorAll('input[name=f_campeonato], input[name=f_evento], input[name=f_texto]')
   .forEach(x => { x.addEventListener('change', aplica); x.addEventListener('input', aplica); });
 aplica();
-mostrarModo();
+mostrar();
 </script>
 {% endblock %}"""
 

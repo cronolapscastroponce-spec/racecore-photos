@@ -40,6 +40,12 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Marcar como publicada.
 - **Ajustes**: la clave de OpenAI y Telegram (opcional). El estado del programador.
 
+## B0. Tipos de publicación
+
+Al crear o editar una publicación, lo primero es elegir **qué tipo es**, y el formulario solo
+enseña lo de ese tipo: **Normal** (tus fotos y textos, los días que elijas), **Eventos**,
+**Horario de apertura** o **Deportes en TV**. En Publicaciones salen agrupadas por tipo.
+
 ## B1. Horario de apertura (fines de semana, puentes, fiestas)
 
 1. **Publicaciones → + Horario de apertura**: sale una publicación ya preparada (en pausa).
@@ -63,6 +69,10 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
 - Los horarios salen de Marca: los calendarios de F1 y MotoGP y su guía de TV (que solo trae
   hoy y mañana). Si no hay nada que cumpla las condiciones, no se publica.
 - En Ajustes → Estado se ve la última lectura; si Marca cambia su página, sale un aviso.
+- **Fotos de cada deporte**: en «Deportes en TV» eliges una categoría para F1, otra para MotoGP y
+  otra para fútbol; se usa la del deporte que salga ese día. Si no eliges, el panel dibuja un
+  fondo genérico (campo de fútbol, o asfalto con pianos y bandera a cuadros). No uses fotos
+  oficiales de internet: tienen derechos.
 - Variables: `{deportes}` y `{dias_deportes}`.
 
 ## B2. Eventos (Racecore y CKS)
