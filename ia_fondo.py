@@ -82,8 +82,8 @@ def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes,
     """Instrucciones para que la IA haga el cartel con los textos exactos.
 
     titulo y franja: listas de líneas (lo que va entre *asteriscos* en color);
-    datos: lista de textos cortos; zona_logo: (ancho %, alto %) libre arriba a la
-    izquierda o None; zona_redes: alto % libre abajo o None; estilo: clave de ESTILOS;
+    datos: lista de textos cortos; zona_logo: (ancho %, alto %, "izquierda"/"derecha"/"centro")
+    libre arriba o None; zona_redes: alto % libre abajo o None; estilo: clave de ESTILOS;
     lista: líneas de un horario que escribe la IA, o zona_lista: (desde %, hasta %) del
     alto que se deja vacío en el centro porque el horario lo pone después app.py.
     """
@@ -122,8 +122,15 @@ def prompt_cartel(titulo, franja, datos, color, ambiente, zona_logo, zona_redes,
                  f"arriba, por encima del {zona_lista[0]} %, y el mensaje destacado y los datos, abajo, por debajo del "
                  f"{zona_lista[1]} %.")
     if zona_logo:
-        p.append(f"- Deja COMPLETAMENTE VACÍA la esquina de arriba a la izquierda (el {zona_logo[0]} % del ancho y el "
-                 f"{zona_logo[1]} % del alto): ahí se pondrá el logo después. No dibujes ningún logotipo ni marca.")
+        sitio = zona_logo[2] if len(zona_logo) > 2 else "izquierda"
+        donde = {"derecha": "la esquina de arriba a la derecha", "centro": "la parte de arriba, en el centro"}.get(
+            sitio, "la esquina de arriba a la izquierda")
+        p.append(f"- En {donde} (el {zona_logo[0]} % del ancho y el {zona_logo[1]} % del alto) no pongas texto ni "
+                 "nada importante: ahí se pondrá el logo después y tiene que leerse bien. Esa zona tiene que ser OSCURA, "
+                 "la propia imagen en sombra: nada de manchas blancas, cielo claro, brillos ni recuadros. "
+                 "No dibujes ningún logotipo ni marca.")
+        if sitio == "centro":
+            p.append("- El título va debajo del logo, no a su lado.")
     else:
         p.append("- No dibujes ningún logotipo ni marca.")
     if zona_redes:

@@ -27,6 +27,9 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
   - Diseño **Sencillo**: texto abajo con una etiqueta de color.
   - Diseño **IA completa** (con clave de OpenAI): la IA hace el cartel con tus textos a partir de
     la foto; el panel pone siempre encima el logo y las redes. Si la IA falla, sale el Cartel.
+    El logo va cada vez en un sitio de arriba (izquierda, derecha o centro) y con una sombra
+    oscura, para que se lea aunque detrás haya algo claro. Con **Estilo: Variado** cambia también
+    el estilo; para que no se parezcan, pon varias fotos en la categoría.
   - Variables: `{dia}` (sábado), `{fecha}` (27 de septiembre) y `{hora}` (18:00).
   - **Varias versiones**: en Título, Franja y Texto del post, sepáralas con una línea `---` y
     el panel las va turnando (1ª, 2ª, 3ª…). La 2ª del título sale con la 2ª del texto.

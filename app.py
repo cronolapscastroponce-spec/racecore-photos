@@ -1734,8 +1734,28 @@ def superponer_cartel(img, pub, occ):
     return img
 
 
-def superponer_marca(img):
-    """Diseño «IA completa»: los textos ya los puso la IA; aquí solo logo y redes, siempre iguales."""
+# «IA completa»: el logo va cada vez en un sitio para que no salgan todas iguales
+SITIOS_LOGO = ("izquierda", "derecha", "centro")
+
+
+def x_logo(W, ancho_logo, sitio):
+    margen = int(W * 0.05)
+    return {"derecha": W - margen - ancho_logo, "centro": (W - ancho_logo) // 2}.get(sitio, margen)
+
+
+def logo_con_sombra(img, lg, x, y):
+    """Logo con una sombra oscura difuminada alrededor: se lee aunque detrás haya algo claro."""
+    W = img.width
+    r = max(6, W // 60)
+    alfa = Image.new("L", (lg.width + 4 * r, lg.height + 4 * r), 0)
+    alfa.paste(lg.getchannel("A"), (2 * r, 2 * r))
+    alfa = alfa.filter(ImageFilter.MaxFilter(2 * (r // 2) + 1)).filter(ImageFilter.GaussianBlur(r))
+    img.paste((0, 0, 0), (x - 2 * r, y - 2 * r), alfa.point(lambda v: int(v * 0.8)))
+    img.paste(lg, (x, y), lg)
+
+
+def superponer_marca(img, sitio="izquierda"):
+    """Diseño «IA completa»: los textos ya los puso la IA; aquí solo logo y redes."""
     W, H = img.size
     arriba, abajo = margenes(W, H)
     banner = banner_redes(W, H)
@@ -1747,9 +1767,9 @@ def superponer_marca(img):
         alto, dibujar = redes
         oscurecer_cartel(img, 0, abajo - alto - int(H * 0.06), vineta=False)
         dibujar(img, abajo - alto)
-    logo = bloque_logo(W, H, 1.0)
-    if logo:
-        logo[1](img, arriba)
+    lg = logo_ajustado(W, H, 1.0)
+    if lg:
+        logo_con_sombra(img, lg, x_logo(W, lg.width, sitio), arriba)
     return img
 
 
@@ -1764,14 +1784,17 @@ def elegir_estilo(pub, evitar=None):
     return random.choice([e for e in ia_fondo.ESTILOS if e != evitar])
 
 
-def prompt_ia_cartel(pub, occ, W, H, estilo="marca", lista=None, zona_lista=None):
+def prompt_ia_cartel(pub, occ, W, H, estilo="marca", lista=None, zona_lista=None, sitio_logo="izquierda"):
     """Prompt para «IA completa», con los huecos exactos que luego ocupan el logo, las redes y, si
     la pone el panel, la lista del centro (horario, deportes...)."""
     arriba, abajo = margenes(W, H)
     lg = logo_ajustado(W, H, 1.0)
     banner = banner_redes(W, H)
     redes = bloque_redes(redes_configuradas(), W, 1.0)
-    zona_logo = (round((W * 0.05 + lg.width) / W * 100) + 4, round((arriba + lg.height) / H * 100) + 3) if lg else None
+    zona_logo = None
+    if lg:
+        ancho_logo = lg.width + W * (0.04 if sitio_logo == "centro" else 0.05)
+        zona_logo = (round(ancho_logo / W * 100) + 4, round((arriba + lg.height) / H * 100) + 3, sitio_logo)
     if banner:
         zona_redes = round((H - banner[2]) / H * 100) + 3
     else:
@@ -1838,12 +1861,15 @@ def componer(pub, occ, evitar=None, evitar_estilo=None):
                     lineas = [l.strip() for l in variables(pub["lista"] or "", occ).split("\n") if l.strip()]
                     la_ia = bool(lineas) and "lista_ia" in pub.keys() and pub["lista_ia"] == "ia"
                     zona = (30, 72) if lineas and not la_ia else None
+                    # con la lista en el centro no queda sitio para el logo en medio
+                    sitio = random.choice([x for x in SITIOS_LOGO if not (zona and x == "centro")])
                     with DIBUJO:
-                        prompt = prompt_ia_cartel(pub, occ, ancho, alto, estilo, lineas if la_ia else None, zona)
+                        prompt = prompt_ia_cartel(pub, occ, ancho, alto, estilo, lineas if la_ia else None, zona,
+                                                  sitio)
                     img = ia_fondo.generar_cartel(ruta, prompt, ancho, alto, clave,
                                                   calidad=ajuste("openai_calidad", "medium"))
                     with DIBUJO:
-                        img = superponer_marca(img)
+                        img = superponer_marca(img, sitio)
                         if zona:
                             pintar_lista(img, lineas, alto * zona[0] // 100, alto * zona[1] // 100,
                                          color_rgb(pub["color"]))
