@@ -2938,7 +2938,8 @@ def ajustes():
                           ejecutar("INSERT INTO categorias (nombre) VALUES ('Tandas CKS')").lastrowid)
         guardar_ajuste("tandas_categoria", elegida if elegida.isdigit() else "")
         for clave in ("openai_key", "telegram_token", *(f"{f}_token" for f in FUENTES)):
-            nuevo = request.form.get(clave, "").strip()
+            # sin espacios, saltos de línea ni comillas que se cuelan al copiar y pegar
+            nuevo = "".join(request.form.get(clave, "").split()).strip("\"'«»“”‘’")
             if request.form.get(f"quitar_{clave}"):
                 guardar_ajuste(clave, "")
             elif nuevo:
@@ -3648,7 +3649,7 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
     <div><label>Dirección del PC de {{ f.nombre }}</label>
       <input type="text" name="{{ f.clave }}_url" value="{{ f.url_ajuste }}" placeholder="Ej: 192.168.1.50  (puerto {{ '8100' if f.clave == 'racecore' else '8090' }} si no pones otro)"></div>
     <div><label>Token de lectura de {{ f.nombre }} {% if f.token %}<span class="chip on">{{ f.token }}</span>{% endif %}</label>
-      <input type="password" name="{{ f.clave }}_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if f.token else 'El que genera ' ~ f.nombre ~ ' en su configuración' }}" autocomplete="off">
+      <input type="password" name="{{ f.clave }}_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if f.token else 'El que genera ' ~ f.nombre ~ ' en su configuración' }}" autocomplete="new-password">
       {% if f.token %}<label style="color:var(--texto); margin-top:6px"><input type="checkbox" name="quitar_{{ f.clave }}_token" value="1"> Quitar el token</label>{% endif %}</div>
   </div>
   {% endfor %}
@@ -3671,7 +3672,7 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   <b>IA de OpenAI (opcional, de pago aparte)</b>
   <div class="ayuda">Sin clave, el panel usa tus fotos tal cual. Con clave aparece el campo «Prompt IA» en las publicaciones.</div>
   <label>Clave de la API {% if openai_key %}<span class="chip on">{{ openai_key }}</span>{% endif %}</label>
-  <input type="password" name="openai_key" placeholder="{{ 'Déjalo vacío para no cambiarla' if openai_key else 'sk-...' }}" autocomplete="off">
+  <input type="password" name="openai_key" placeholder="{{ 'Déjalo vacío para no cambiarla' if openai_key else 'sk-...' }}" autocomplete="new-password">
   {% if openai_key %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_openai_key" value="1"> Quitar la clave</label>{% endif %}
   <label>Calidad de imagen</label>
   <select name="openai_calidad">
@@ -3684,7 +3685,7 @@ PLANTILLAS["ajustes.html"] = """{% extends "base.html" %}
   <div class="ayuda">Si lo configuras, cada imagen programada te llega al móvil con su texto (las pruebas no).</div>
   <div class="ayuda">1) En Telegram, habla con <b>@BotFather</b>: /newbot, ponle un nombre y copia el token aquí. 2) Guarda. 3) Abre tu bot, mándale «hola» y pulsa «Detectar mi chat». 4) «Probar Telegram».</div>
   <label>Token del bot {% if telegram_token %}<span class="chip on">{{ telegram_token }}</span>{% endif %}</label>
-  <input type="password" name="telegram_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if telegram_token else '123456:ABC...' }}" autocomplete="off">
+  <input type="password" name="telegram_token" placeholder="{{ 'Déjalo vacío para no cambiarlo' if telegram_token else '123456:ABC...' }}" autocomplete="new-password">
   {% if telegram_token %}<label style="color:var(--texto)"><input type="checkbox" name="quitar_telegram_token" value="1"> Quitar el token</label>{% endif %}
   <label>Chat ID</label>
   <input type="text" name="telegram_chat" value="{{ telegram_chat }}">
