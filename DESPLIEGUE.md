@@ -21,6 +21,9 @@ Doble clic en **`actualizar.bat`**. Baja la última versión sin tocar fotos, pu
 ## B. Usar el panel
 
 - **Fotos**: crea categorías y sube fotos. Puedes elegir cientos a la vez: se suben de una en una.
+  Para encajar cada foto en el formato no se recorta por el centro: el panel busca al piloto (lo más
+  nítido) y recorta a su alrededor. Si habría que quitar demasiado (una foto horizontal en una story),
+  la pone entera sobre la misma foto ampliada y difuminada.
 - **Publicaciones**: días o fecha, hora, antelación, categoría, formato, diseño y textos.
   - Diseño **Cartel**: título grande (lo que va entre `*asteriscos*` sale en color), franja
     de color (la última línea sale más grande), datos separados con `|` y tus redes abajo.

@@ -1811,6 +1811,50 @@ def superponer(img, pub, occ):
     return superponer_cartel(img, pub, occ)  # también si «IA completa» no ha podido usarse
 
 
+# Si para llenar el formato hubiera que quedarse con menos de esta parte de la foto, va entera
+MINIMO_RECORTE = 0.45
+
+
+def posicion_protagonista(im, horizontal, guarda):
+    """Por dónde recortar (0 = desde el principio, 1 = desde el final) para quedarse con la zona más
+    nítida y con más detalle: en las fotos de pista es el piloto, porque el fondo va desenfocado."""
+    n = 160
+    w, h = im.size
+    tam = (n, max(8, round(n * h / w))) if horizontal else (max(8, round(n * w / h)), n)
+    bordes = im.convert("L").resize(tam).filter(ImageFilter.FIND_EDGES)
+    px, (bw, bh) = bordes.load(), bordes.size
+    largo, ancho = (bw, bh) if horizontal else (bh, bw)
+    # la primera y la última fila/columna no se cuentan: el filtro las deja sin tratar
+    perfil = [0] + [sum(px[i, j] if horizontal else px[j, i] for j in range(1, ancho - 1))
+                    for i in range(1, largo - 1)] + [0]
+    k = round(largo * guarda)
+    if k >= largo:
+        return 0.5
+    # más peso en el centro del recorte: que el protagonista quede en medio, no pegado al borde
+    pesos = [1 - 0.6 * abs(2 * (j + 0.5) / k - 1) for j in range(k)]
+    mejor = max(range(largo - k + 1), key=lambda i: (sum(perfil[i + j] * pesos[j] for j in range(k)),
+                                                      -abs(i - (largo - k) / 2)))
+    return mejor / (largo - k)
+
+
+def encuadrar(im, ancho, alto):
+    """La foto al tamaño de la publicación sin cortar al protagonista: se recorta por donde está él, no
+    por el centro, y si habría que quitar demasiado (una foto horizontal en una story) va entera sobre
+    la misma foto ampliada, difuminada y más oscura."""
+    w, h = im.size
+    horizontal = w / h > ancho / alto  # sobra foto a los lados (si no, arriba y abajo)
+    guarda = (ancho / alto) / (w / h) if horizontal else (w / h) / (ancho / alto)
+    if guarda < MINIMO_RECORTE:
+        fondo = ImageOps.fit(im, (max(1, ancho // 10), max(1, alto // 10)), Image.LANCZOS)
+        fondo = fondo.filter(ImageFilter.GaussianBlur(4)).resize((ancho, alto), Image.BICUBIC)
+        fondo = ImageEnhance.Brightness(fondo).enhance(0.55)
+        foto = ImageOps.contain(im, (ancho, alto), Image.LANCZOS)
+        fondo.paste(foto, ((ancho - foto.width) // 2, (alto - foto.height) // 2))
+        return fondo
+    p = posicion_protagonista(im, horizontal, guarda) if guarda < 0.98 else 0.5
+    return ImageOps.fit(im, (ancho, alto), Image.LANCZOS, centering=(p, 0.5) if horizontal else (0.5, p))
+
+
 def elegir_foto(pub_id, fotos, evitar=None):
     """Una al azar, sin repetir «evitar» ni, si no se indica, la última usada en esta publicación."""
     if not fotos:
@@ -1888,7 +1932,7 @@ def componer(pub, occ, evitar=None, evitar_estilo=None):
                 avisos.append(f"IA: ha fallado ({str(e)[:300]}). Se ha usado la foto original.")
         if fondo is None:
             with Image.open(ruta) as im:
-                fondo = ImageOps.fit(ImageOps.exif_transpose(im).convert("RGB"), (ancho, alto), Image.LANCZOS)
+                fondo = encuadrar(ImageOps.exif_transpose(im).convert("RGB"), ancho, alto)
     finally:
         if temporal:
             temporal.unlink(missing_ok=True)
